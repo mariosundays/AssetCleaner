@@ -30,6 +30,7 @@ for name in ("_browse_root", "refresh", "_run", "_restore",
              "_on_scene_selected", "_on_scene_double_click",
              "_scene_files_menu", "_show_users", "_move_refs",
              "_scan_scenes", "_cancel_scene_scan", "_open_file",
+             "_regroup", "_toggle_grouping",
              "fit_columns", "_populate", "_populate_scenes",
              "_fill_ref_table", "_update_status", "_update_legend",
              "_apply_states", "_reveal", "_ref_at", "_scene_at"):
@@ -99,5 +100,21 @@ check("isfile" in src, "a file that has gone is reported, not silently ignored")
 
 src = inspect.getsource(ac.CleanerDialog._on_double_click)
 check("_open_file" in src, "double-click opens the file itself")
+
+# -- grouping is wired into the table -------------------------------------
+
+src = inspect.getsource(ac.CleanerDialog._populate)
+check("self.groups" in src, "the table renders groups, not raw orphans")
+check("PartiallyChecked" in src, "a part-ticked sequence shows as partial")
+
+src = inspect.getsource(ac.CleanerDialog._ref_at)
+check("self.groups" in src, "a row resolves to its group")
+
+src = inspect.getsource(ac.CleanerDialog._move_refs)
+check("orphans" in src and "getattr" in src,
+      "moving flattens groups back to individual files")
+
+src = inspect.getsource(ac.CleanerDialog._context_menu)
+check("g.count" in src, "the menu counts files, not rows")
 
 done("test_ui")

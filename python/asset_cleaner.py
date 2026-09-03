@@ -700,6 +700,166 @@ class Orphan(object):
         return "{}/{}/{}".format(self.root, UNUSED_FOLDER, self.relative)
 
 
+# ---------------------------------------------------------------------------
+# Grouping -- one row per sequence instead of one row per frame
+#
+# A render folder holds thousands of frames. Listed one per row they bury
+# everything else and make the table useless. A group is purely a display
+# and selection convenience: the Orphan objects underneath are still what
+# gets moved, so nothing about the move or restore changes.
+# ---------------------------------------------------------------------------
+
+class Group(object):
+    """
+    One row in the table: either a single file or a whole sequence.
+
+    Presents the same interface the table reads off an Orphan -- name, size,
+    reason, folder -- so the UI does not care which it is looking at.
+    """
+
+    def __init__(self, orphans, stem=None):
+        self.orphans = list(orphans)
+        self.stem = stem
+        first = self.orphans[0]
+        self.root = first.root
+        self.folder = first.folder
+        self.ext_label = first.ext_label
+
+    # -- what the table shows ---------------------------------------------
+
+    @property
+    def is_sequence(self):
+        return len(self.orphans) > 1
+
+    @property
+    def count(self):
+        return len(self.orphans)
+
+    @property
+    def name(self):
+        """'beauty.[0001-0240].exr  (240 files)' for a sequence."""
+        if not self.is_sequence:
+            return self.orphans[0].name
+        frames = sorted(f for f in (frame_number(o.path) for o in self.orphans)
+                        if f is not None)
+        base = os.path.basename(self.stem or "")
+        ext = file_ext(self.orphans[0].path)
+        if frames:
+            span = ("{:0{w}d}-{:0{w}d}".format(
+                frames[0], frames[-1], w=frame_width(self.orphans[0].path)))
+        else:
+            span = "..."
+        return "{}[{}]{}  ({} files)".format(base, span, ext, self.count)
+
+    @property
+    def size_bytes(self):
+        return sum(o.size_bytes for o in self.orphans)
+
+    @property
+    def mtime(self):
+        """The newest frame -- a sequence is as recent as its last write."""
+        return max((o.mtime for o in self.orphans), default=0)
+
+    @property
+    def age(self):
+        return _age(self.mtime)
+
+    @property
+    def path(self):
+        """A representative path, for Copy path and Show in Explorer."""
+        return self.orphans[0].path
+
+    @property
+    def reason(self):
+        """
+        The most cautious reason in the group.
+
+        If any frame is protected the whole row says so, because ticking the
+        row moves every frame in it.
+        """
+        for reason in (SAFE_OTHER_SCENE, SAFE_PARTIAL_SEQ, SAFE_SIDECAR,
+                       SAFE_VERSION, SAFE_NEVER, SAFE_BACKUP):
+            if any(o.reason == reason for o in self.orphans):
+                return reason
+        return self.orphans[0].reason
+
+    @property
+    def other_scenes(self):
+        seen = []
+        for orphan in self.orphans:
+            for scene in orphan.other_scenes:
+                if scene not in seen:
+                    seen.append(scene)
+        return seen
+
+    # -- selection ---------------------------------------------------------
+
+    @property
+    def selected(self):
+        return all(o.selected for o in self.orphans)
+
+    @selected.setter
+    def selected(self, state):
+        for orphan in self.orphans:
+            orphan.selected = state
+
+    @property
+    def partially_selected(self):
+        picked = [o for o in self.orphans if o.selected]
+        return 0 < len(picked) < len(self.orphans)
+
+
+# A frame number in a filename, with its padding preserved.
+FRAME_NUM_RE = re.compile(r"^(?P<stem>.*?)(?P<frame>\d{3,8})(?P<ext>\.[^.]+)$")
+
+
+def frame_number(path):
+    """The frame number in a filename, or None."""
+    match = FRAME_NUM_RE.match(os.path.basename(_key(path)))
+    return int(match.group("frame")) if match else None
+
+
+def frame_width(path):
+    """How many digits the frame number is padded to."""
+    match = FRAME_NUM_RE.match(os.path.basename(_key(path)))
+    return len(match.group("frame")) if match else 4
+
+
+def group_orphans(orphans, enabled=True):
+    """
+    Collapse runs of numbered frames into one row each.
+
+    Files that are not part of a sequence come back as groups of one, so the
+    table only ever deals in groups. Order is preserved: a group appears
+    where its first frame did.
+    """
+    if not enabled:
+        return [Group([o]) for o in orphans]
+
+    groups = []
+    by_stem = {}
+
+    for orphan in orphans:
+        stem = frame_stem(orphan.path)
+        # Only group when the frames share a folder AND an extension --
+        # "cache.001.bgeo" and "cache.001.exr" are not one sequence.
+        key = None if stem is None else (stem, file_ext(orphan.path))
+
+        if key is None:
+            groups.append(Group([orphan]))
+            continue
+
+        existing = by_stem.get(key)
+        if existing is None:
+            group = Group([orphan], stem=stem)
+            by_stem[key] = group
+            groups.append(group)
+        else:
+            existing.orphans.append(orphan)
+
+    return groups
+
+
 def walk_project(root):
     """Every asset file under the project root, skipping the noise folders."""
     root = _clean(root)
@@ -1029,7 +1189,9 @@ class CleanerDialog(QtWidgets.QDialog):
         self.resize(1120, 640)
         self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint)
 
-        self.orphans = []
+        self.orphans = []           # every unused file, flat
+        self.groups = []            # what the table shows: sequences collapsed
+        self.group_sequences = True
         self.scenes = []
         self._scanned_scenes = False        # has the sibling scan been run
         self._scene_scan_cancelled = False
@@ -1143,6 +1305,15 @@ class CleanerDialog(QtWidgets.QDialog):
             btn = QtWidgets.QPushButton(label)
             btn.clicked.connect(slot)
             row.addWidget(btn)
+
+        self.group_check = QtWidgets.QCheckBox("Group sequences")
+        self.group_check.setChecked(True)
+        self.group_check.setToolTip(
+            "Collapse numbered frames into one row each. Turn off to see "
+            "and tick individual frames.")
+        self.group_check.toggled.connect(self._toggle_grouping)
+        row.addWidget(self.group_check)
+
         row.addStretch(1)
         box.addLayout(row)
         return page
@@ -1253,6 +1424,7 @@ class CleanerDialog(QtWidgets.QDialog):
         root = _clean(self.root_field.text()) or project_root()
         if not root or not os.path.isdir(root):
             self.orphans, self.scenes = [], []
+            self._regroup()
             self._populate()
             self.status.setText(
                 "Project root does not exist. Browse to a folder to scan.")
@@ -1265,6 +1437,8 @@ class CleanerDialog(QtWidgets.QDialog):
             self.orphans, self.scenes = scan(root, check_other_scenes=False)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+
+        self._regroup()
 
         # A rescan invalidates whatever the last sibling scan concluded.
         self._scanned_scenes = False
@@ -1280,22 +1454,42 @@ class CleanerDialog(QtWidgets.QDialog):
 
     # -- the unused table ---------------------------------------------------
 
+    def _toggle_grouping(self, on):
+        """Collapse or expand sequences without rescanning the disk."""
+        self.group_sequences = bool(on)
+        self._regroup()
+        self._populate()
+        self._update_status()
+        if not self._user_sized:
+            QtCore.QTimer.singleShot(0, self.fit_columns)
+
+    def _regroup(self):
+        """Rebuild the display rows from the flat orphan list."""
+        self.groups = group_orphans(self.orphans, self.group_sequences)
+
     def _populate(self):
         table = self.table
         table.setSortingEnabled(False)
         table.blockSignals(True)
         table.setRowCount(0)
 
-        for orphan in self.orphans:
+        for index, orphan in enumerate(self.groups):
             row = table.rowCount()
             table.insertRow(row)
 
             check = QtWidgets.QTableWidgetItem()
             check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled |
                            Qt.ItemIsSelectable)
-            check.setCheckState(
-                Qt.Checked if orphan.selected else Qt.Unchecked)
-            check.setData(Qt.UserRole, orphan.path)
+            # A sequence with only some frames ticked shows as partial rather
+            # than lying in either direction.
+            if orphan.partially_selected:
+                check.setCheckState(Qt.PartiallyChecked)
+            else:
+                check.setCheckState(
+                    Qt.Checked if orphan.selected else Qt.Unchecked)
+            # Rows are keyed by their index in self.groups: a path is not
+            # unique enough once a row stands for many files.
+            check.setData(Qt.UserRole, index)
             table.setItem(row, COL_ON, check)
 
             ext = SortableItem(orphan.ext_label)
@@ -1303,7 +1497,16 @@ class CleanerDialog(QtWidgets.QDialog):
             table.setItem(row, COL_EXT, ext)
 
             name = SortableItem(orphan.name)
-            name.setToolTip(orphan.path)
+            if orphan.is_sequence:
+                shown = [o.name for o in orphan.orphans[:12]]
+                tip = "{} files:".format(orphan.count)
+                tip += "".join("\n  " + n for n in shown)
+                if orphan.count > len(shown):
+                    tip += "\n  ... and {} more".format(
+                        orphan.count - len(shown))
+                name.setToolTip(tip)
+            else:
+                name.setToolTip(orphan.path)
             table.setItem(row, COL_FILE, name)
 
             folder = SortableItem(orphan.folder)
@@ -1335,14 +1538,15 @@ class CleanerDialog(QtWidgets.QDialog):
         table.setSortingEnabled(True)
 
     def _ref_at(self, row):
+        """The Group shown on this row, or None."""
         item = self.table.item(row, COL_ON)
         if item is None:
             return None
-        path = item.data(Qt.UserRole)
-        for orphan in self.orphans:
-            if orphan.path == path:
-                return orphan
-        return None
+        index = item.data(Qt.UserRole)
+        try:
+            return self.groups[int(index)]
+        except (TypeError, ValueError, IndexError):
+            return None
 
     def _selected_rows(self):
         return sorted({i.row() for i in self.table.selectedIndexes()})
@@ -1374,9 +1578,21 @@ class CleanerDialog(QtWidgets.QDialog):
         if item.column() != COL_ON:
             return
         orphan = self._ref_at(item.row())
-        if orphan is not None:
-            orphan.selected = item.checkState() == Qt.Checked
-            self._update_status()
+        if orphan is None:
+            return
+
+        state = item.checkState()
+        # A partly-ticked sequence resolves to fully ticked when clicked,
+        # rather than leaving the user in a third state they cannot act on.
+        selected = state != Qt.Unchecked
+        orphan.selected = selected
+
+        if state == Qt.PartiallyChecked:
+            self.table.blockSignals(True)
+            item.setCheckState(Qt.Checked)
+            self.table.blockSignals(False)
+
+        self._update_status()
 
     def _on_double_click(self, item):
         """
@@ -1445,11 +1661,15 @@ class CleanerDialog(QtWidgets.QDialog):
 
         menu = QtWidgets.QMenu(self)
 
-        if len(rows) > 1:
-            menu.addAction("Move these {} files now".format(len(rows)),
-                           lambda: self._move_refs(
-                               [self._ref_at(r) for r in rows],
-                               "Move {} files".format(len(rows))))
+        # Count files, not rows -- one row can be a 240-frame sequence.
+        picked = [self._ref_at(r) for r in rows]
+        n_files = sum(g.count for g in picked if g is not None)
+
+        if n_files > 1:
+            menu.addAction(
+                "Move these {} files now".format(n_files),
+                lambda: self._move_refs(
+                    picked, "Move {} files".format(n_files)))
         else:
             menu.addAction("Move this file now",
                            lambda: self._move_refs([orphan], "Move one file"))
@@ -1504,7 +1724,12 @@ class CleanerDialog(QtWidgets.QDialog):
     # -- selection helpers --------------------------------------------------
 
     def _apply_states(self, chooser):
-        """Re-tick every row from a function of the orphan."""
+        """
+        Re-tick every row from a function of the row.
+
+        Setting Group.selected propagates to every frame underneath, so a
+        sequence is always ticked or unticked as a whole here.
+        """
         self.table.blockSignals(True)
         for row in range(self.table.rowCount()):
             orphan = self._ref_at(row)
@@ -1519,6 +1744,8 @@ class CleanerDialog(QtWidgets.QDialog):
         self._update_status()
 
     def _select_recommended(self):
+        # Group.reason is the most cautious reason in the group, so a
+        # sequence holding even one protected frame is not ticked.
         self._apply_states(lambda o: o.reason in AUTO_SELECT)
 
     def _select_all(self):
@@ -1789,9 +2016,15 @@ class CleanerDialog(QtWidgets.QDialog):
                 len(chosen), "" if len(chosen) == 1 else "s")
             if chosen else "Move to _unused")
 
+        collapsed = ""
+        sequences = sum(1 for g in self.groups if g.is_sequence)
+        if sequences:
+            collapsed = " in {} rows ({} sequence{})".format(
+                len(self.groups), sequences, "" if sequences == 1 else "s")
+
         self.status.setText(
-            "{} unused file(s), {} on disk.   {} ticked, {} would be "
-            "freed.".format(len(self.orphans), _human(total_bytes),
+            "{} unused file(s){}, {} on disk.   {} ticked, {} would be "
+            "freed.".format(len(self.orphans), collapsed, _human(total_bytes),
                             len(chosen), _human(chosen_bytes)))
 
         # The honest caveat. Until the sibling scan has run, this list only
@@ -1829,7 +2062,21 @@ class CleanerDialog(QtWidgets.QDialog):
             len(chosen), "" if len(chosen) == 1 else "s"))
 
     def _move_refs(self, refs, title):
-        refs = [r for r in refs if r is not None]
+        """
+        Move a set of rows. Rows may be Groups, so flatten to the actual
+        files first -- move_out() works on Orphans, and a sequence row
+        stands for every frame in it.
+        """
+        flat = []
+        seen = set()
+        for ref in refs:
+            if ref is None:
+                continue
+            for orphan in getattr(ref, "orphans", [ref]):
+                if orphan.path not in seen:
+                    seen.add(orphan.path)
+                    flat.append(orphan)
+        refs = flat
         if not refs:
             return
 

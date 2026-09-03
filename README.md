@@ -124,6 +124,27 @@ tab warns you in orange until you have. Beyond that:
 
 Run it on a copy of a project the first time.
 
+## Sequences
+
+A render folder holds thousands of frames, and one row each buries everything
+else. Numbered frames are collapsed into a single row:
+
+    beauty.[0001-0240].exr  (240 files)      render      689.4 MB
+
+The row carries the whole sequence: its size is the total, its date is the
+newest frame, and ticking it moves every frame. Hover the name to see the
+individual files.
+
+Frames are only grouped when they share a folder **and** an extension, so
+`cache.0001.bgeo` and `cache.0001.exr` stay separate.
+
+A sequence takes the **most cautious** reason of any frame in it. If one frame
+of an otherwise unused sequence is referenced by another scene, the whole row
+reads `used by other scene` and is not ticked -- because ticking it would move
+that frame too. Such a row shows a partial tick.
+
+Untick **Group sequences** to go back to one row per file.
+
 ## Table
 
 - **Click a column heading** to sort. Size sorts by bytes and Modified by
