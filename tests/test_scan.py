@@ -51,7 +51,7 @@ try:
         def name(self):
             return "file"
 
-    ac._iter_file_parms = lambda: iter([FakeParm(used)])
+    ac._iter_file_parms = lambda: iter([(FakeParm(used), None)])
     ac.hou.hipFile = types.SimpleNamespace(
         path=lambda: root + "/current.hip")
 

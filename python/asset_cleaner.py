@@ -315,7 +315,38 @@ def frame_stem(path):
 # ---------------------------------------------------------------------------
 
 def _iter_file_parms():
-    """Yield every file-typed parameter in the scene."""
+    """
+    Yield every file-typed parameter in the scene.
+
+    hou.fileReferences() does this in one C++ call. The obvious alternative --
+    walking allSubChildren() and asking each parm for its parmTemplate() --
+    builds a Python object for every parameter on every node, which on a real
+    scene is tens of thousands of crossings and takes tens of seconds. This
+    returns in well under one.
+
+    Yields (parm, resolved_path) pairs. The path comes back already expanded,
+    so the caller does not have to eval() the parameter again. resolved is
+    None on the fallback path, meaning "work it out yourself".
+    """
+    try:
+        references = hou.fileReferences()
+    except Exception:
+        references = None
+
+    if references is not None:
+        for parm, path in references:
+            if parm is None:
+                continue
+            try:
+                if parm.name() in SKIP_PARM_NAMES:
+                    continue
+            except Exception:
+                continue
+            yield parm, path
+        return
+
+    # Fallback for anything that does not expose fileReferences(). Slow, but
+    # only reached if the fast path is unavailable.
     for node in hou.node("/").allSubChildren(top_down=True,
                                              recurse_in_locked_nodes=False):
         try:
@@ -335,7 +366,7 @@ def _iter_file_parms():
                 continue
             if parm.name() in SKIP_PARM_NAMES:
                 continue
-            yield parm
+            yield parm, None
 
 
 def scene_references():
@@ -350,25 +381,27 @@ def scene_references():
     stems = set()
     by_path = {}
 
-    for parm in _iter_file_parms():
-        try:
-            raw = parm.unexpandedString()
-        except Exception:
-            continue
-        if not raw or not raw.strip():
-            continue
+    for parm, supplied in _iter_file_parms():
+        # fileReferences() hands back the expanded path already, so only fall
+        # back to eval() when we came in through the slow path.
+        resolved = supplied
+        if resolved is None:
+            try:
+                resolved = parm.eval()
+            except Exception:
+                continue
 
-        try:
-            resolved = parm.eval()
-        except Exception:
-            continue
         if not resolved or not resolved.strip():
             continue
 
         resolved = _clean(resolved)
         if resolved.startswith(("op:", "http:", "https:", "opdef:")):
             continue
+        if not os.path.isabs(resolved):
+            continue
 
+        # Only paid for references we actually keep, and only to label the
+        # "used by" tooltip -- never to decide whether a file is in use.
         try:
             node_path = parm.node().path()
         except Exception:
@@ -679,6 +712,26 @@ def walk_project(root):
     return out
 
 
+def version_index(paths):
+    """
+    Map (folder, versionless name) -> the highest version number seen there.
+
+    Built once per scan. Without it, deciding whether a _v001 is superseded
+    means rescanning the whole disk list for every versioned file, which is
+    quadratic and noticeable on a big texture library.
+    """
+    index = {}
+    for path in paths:
+        version = version_of(path)
+        if version is None:
+            continue
+        key = _key(path)
+        group = (os.path.dirname(key), version_stem(path))
+        if version > index.get(group, -1):
+            index[group] = version
+    return index
+
+
 def classify_orphan(path, used_paths, used_stems, all_on_disk):
     """
     Decide whether a file is an orphan and, if so, how safe it is to move.
@@ -714,19 +767,16 @@ def classify_orphan(path, used_paths, used_stems, all_on_disk):
                 return SAFE_SIDECAR
 
     # An older version of something that also exists at a higher version.
+    #
+    # all_on_disk may be the prebuilt index from version_index(); fall back to
+    # building one for a bare list so the function still works standalone.
     version = version_of(path)
     if version is not None:
-        stem_name = version_stem(path)
-        folder = os.path.dirname(key)
-        for other in all_on_disk:
-            other_key = _key(other)
-            if other_key == key or os.path.dirname(other_key) != folder:
-                continue
-            if version_stem(other) != stem_name:
-                continue
-            other_version = version_of(other)
-            if other_version is not None and other_version > version:
-                return SAFE_VERSION
+        index = (all_on_disk if isinstance(all_on_disk, dict)
+                 else version_index(all_on_disk))
+        highest = index.get((os.path.dirname(key), version_stem(path)))
+        if highest is not None and highest > version:
+            return SAFE_VERSION
 
     return SAFE_NEVER
 
@@ -775,9 +825,11 @@ def scan(root=None, check_other_scenes=False, progress=None):
     used_paths, used_stems, _by_path = scene_references()
     on_disk = walk_project(root)
 
+    versions = version_index(on_disk)
+
     orphans = []
     for path in on_disk:
-        reason = classify_orphan(path, used_paths, used_stems, on_disk)
+        reason = classify_orphan(path, used_paths, used_stems, versions)
         if reason is not None:
             orphans.append(Orphan(path, root, reason))
 

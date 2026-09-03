@@ -76,4 +76,18 @@ check(sig.parameters["check_other_scenes"].default is False,
 check(ac.WARN_STYLE != ac.INFO_STYLE,
       "the unscanned banner looks different from the scanned one")
 
+# -- the scene walk must use the fast path --------------------------------
+# parmTemplate() on every parm of every node is tens of thousands of C++
+# crossings and took ~30s to open on a real scene. hou.fileReferences() is
+# one call. If this assertion ever fails, the window got slow again.
+
+src = inspect.getsource(ac._iter_file_parms)
+check("fileReferences" in src, "the scene walk uses hou.fileReferences()")
+check(src.index("fileReferences") < src.index("allSubChildren"),
+      "and the slow walk is only the fallback, not the first choice")
+
+src = inspect.getsource(ac.scene_references)
+check("supplied" in src,
+      "the expanded path from fileReferences() is reused, not re-eval()ed")
+
 done("test_ui")

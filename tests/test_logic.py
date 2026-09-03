@@ -139,4 +139,30 @@ check(ac.classify_orphan("C:/proj/tex/fire_render.exr", explicit, frame_stems,
                          []) == ac.SAFE_NEVER,
       "a prefix match that is not a frame stays a plain orphan")
 
+# -- the version index -----------------------------------------------------
+# Deciding whether a _v001 is superseded used to rescan the whole disk list
+# per file: 3000 versioned files took 37s. The index makes it a dict lookup.
+
+vdisk = ["C:/proj/tex/a_v001.exr", "C:/proj/tex/a_v002.exr",
+         "C:/proj/tex/b_v001.exr", "C:/proj/other/a_v009.exr"]
+vindex = ac.version_index(vdisk)
+
+check(vindex[("c:/proj/tex", ac.version_stem("a.exr"))] == 2,
+      "highest version per folder+stem")
+check(vindex[("c:/proj/other", ac.version_stem("a.exr"))] == 9,
+      "a different folder is a different group")
+
+# The index and the plain list must classify identically.
+for path in vdisk:
+    check(ac.classify_orphan(path, set(), set(), vdisk)
+          == ac.classify_orphan(path, set(), set(), vindex),
+          "index and list agree for " + path)
+
+check(ac.classify_orphan("C:/proj/tex/a_v001.exr", set(), set(),
+                         vindex) == ac.SAFE_VERSION,
+      "superseded version found through the index")
+check(ac.classify_orphan("C:/proj/tex/b_v001.exr", set(), set(),
+                         vindex) == ac.SAFE_NEVER,
+      "a lone version is not superseded by a sibling with another name")
+
 done("test_logic")
