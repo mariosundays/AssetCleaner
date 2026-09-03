@@ -11,6 +11,7 @@ stubbed by `_stub.py`, so these run under any Python 3 with no dependencies:
 | `test_hipscan.py` | Reading asset paths out of a `.hip` without opening it |
 | `test_move.py` | Move and restore end to end, on real temp files |
 | `test_scan.py` | The whole scan, including the other-scene downgrade |
+| `test_frames.py` | Compound extensions (.bgeo.sc) and the sequence safety net |
 | `test_group.py` | Collapsing frame sequences into one row each |
 | `test_group_move.py` | Moving a sequence row moves every frame in it |
 | `test_ui.py` | Column ids, signal targets, sortable cells |

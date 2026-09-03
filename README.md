@@ -117,6 +117,12 @@ tab warns you in orange until you have. Beyond that:
 - A path built by an **expression** at cook time may not be found by either
   method. Check the count on the Other scenes tab looks plausible before
   trusting a big selection.
+- Every reference registers its **sequence stem**, so if a `$F` path resolves
+  to nothing on disk -- wrong padding, frames not rendered yet -- the frames
+  are still flagged `partial sequence` rather than called unused.
+- If something you know is referenced still shows up, right-click it and pick
+  **Why is this here?**. It prints the exact key the scan matched on and the
+  referenced files in the same folder, which usually shows the mismatch.
 - Scenes **outside** the project folder that reference files inside it are not
   seen at all.
 - The move is reversible, so the recovery from a mistake is one button. That
@@ -135,8 +141,10 @@ The row carries the whole sequence: its size is the total, its date is the
 newest frame, and ticking it moves every frame. Hover the name to see the
 individual files.
 
-Frames are only grouped when they share a folder **and** an extension, so
-`cache.0001.bgeo` and `cache.0001.exr` stay separate.
+Compound extensions are handled, so `cache.0001.bgeo.sc` -- the standard
+Houdini cache -- groups like anything else. Frames are only grouped when they
+share a folder **and** an extension, so `cache.0001.bgeo` and
+`cache.0001.exr` stay separate.
 
 A sequence takes the **most cautious** reason of any frame in it. If one frame
 of an otherwise unused sequence is referenced by another scene, the whole row

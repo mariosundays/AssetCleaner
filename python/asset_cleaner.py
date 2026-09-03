@@ -288,8 +288,40 @@ def sequence_stem(path):
     return path
 
 
-# A frame number in an otherwise literal filename: fire.0007.exr, fire_0007.exr
-FRAME_RE = re.compile(r"^(?P<stem>.*?)(?P<frame>\d{3,8})(?P<ext>\.[^.]+)$")
+# A frame number at the end of a name, before the extension. The extension is
+# stripped by file_ext() first rather than matched here, so compound suffixes
+# like .bgeo.sc work -- matching "\.[^.]+$" instead would fail on every
+# Houdini cache written as name.0001.bgeo.sc.
+FRAME_RE = re.compile(r"^(?P<stem>.*?)(?P<frame>\d{3,8})$")
+
+
+def split_frame(path):
+    """
+    Split a filename into (folder, stem, frame number, padding, extension).
+
+    Returns None when the name does not end in a frame number.
+
+        'C:/p/geo/cache.0007.bgeo.sc'
+            -> ('c:/p/geo', 'cache.', 7, 4, '.bgeo.sc')
+
+    One parser for every caller, because the frame rules have to agree: what
+    groups into a sequence row and what counts as protecting its neighbours
+    must be the same question.
+    """
+    key = _key(path)
+    folder, name = os.path.split(key)
+
+    ext = file_ext(name)
+    if not ext:
+        return None
+    base = name[:-len(ext)]
+
+    match = FRAME_RE.match(base)
+    if not match:
+        return None
+
+    frame = match.group("frame")
+    return folder, match.group("stem"), int(frame), len(frame), ext
 
 
 def frame_stem(path):
@@ -303,12 +335,11 @@ def frame_stem(path):
     unrelated files and would be ticked for removal -- which is how a tool
     like this quietly eats a cache.
     """
-    key = _key(path)
-    folder, name = os.path.split(key)
-    match = FRAME_RE.match(name)
-    if not match:
+    parts = split_frame(path)
+    if parts is None:
         return None
-    return "{}/{}".format(folder, match.group("stem"))
+    folder, stem, _frame, _width, _ext = parts
+    return "{}/{}".format(folder, stem)
 
 
 # ---------------------------------------------------------------------------
@@ -336,7 +367,13 @@ def _iter_file_parms():
 
     if references is not None:
         for parm, path in references:
+            # parm is None for a reference that belongs to no parameter --
+            # a $HIP-relative path Houdini tracks itself, for instance. It
+            # is still a real reference, so it must still protect its file;
+            # dropping it is how a used file gets called never referenced.
             if parm is None:
+                if path:
+                    yield None, path
                 continue
             try:
                 if parm.name() in SKIP_PARM_NAMES:
@@ -387,6 +424,8 @@ def scene_references():
         # back to eval() when we came in through the slow path.
         resolved = supplied
         if resolved is None:
+            if parm is None:
+                continue
             try:
                 resolved = parm.eval()
             except Exception:
@@ -395,6 +434,9 @@ def scene_references():
         if not resolved or not resolved.strip():
             continue
 
+        # A parameter can carry surrounding quotes or stray whitespace; both
+        # would make an otherwise identical path fail to match the disk walk.
+        resolved = resolved.strip().strip('"').strip("'").strip()
         resolved = _clean(resolved)
         if resolved.startswith(("op:", "http:", "https:", "opdef:")):
             continue
@@ -404,7 +446,7 @@ def scene_references():
         # Only paid for references we actually keep, and only to label the
         # "used by" tooltip -- never to decide whether a file is in use.
         try:
-            node_path = parm.node().path()
+            node_path = parm.node().path() if parm is not None else "(scene)"
         except Exception:
             node_path = "?"
 
@@ -412,8 +454,6 @@ def scene_references():
         # holding a variable Houdini only expands at cook time. Glob those
         # rather than treating them as one literal, unmatchable filename.
         if is_sequence(resolved) or VARIABLE_RE.search(resolved):
-            if is_sequence(resolved):
-                stems.add(sequence_stem(resolved))
             for frame in expand_glob(resolved):
                 k = _key(frame)
                 paths.add(k)
@@ -422,10 +462,16 @@ def scene_references():
             k = _key(resolved)
             paths.add(k)
             by_path.setdefault(k, []).append(node_path)
-            # An explicit frame still implies the sequence around it.
-            numbered = frame_stem(k)
-            if numbered:
-                stems.add(numbered)
+
+        # Register the sequence stem for EVERY reference, whatever form it
+        # took. This is the safety net: if the glob above resolved nothing --
+        # wrong padding, frames not rendered yet, a token we cannot expand --
+        # the stem still marks the whole sequence as spoken for, so its
+        # frames are flagged rather than offered up as never referenced.
+        stem = (sequence_stem(resolved) if is_sequence(resolved)
+                else frame_stem(resolved))
+        if stem:
+            stems.add(stem)
 
     return paths, stems, by_path
 
@@ -809,20 +855,16 @@ class Group(object):
         return 0 < len(picked) < len(self.orphans)
 
 
-# A frame number in a filename, with its padding preserved.
-FRAME_NUM_RE = re.compile(r"^(?P<stem>.*?)(?P<frame>\d{3,8})(?P<ext>\.[^.]+)$")
-
-
 def frame_number(path):
     """The frame number in a filename, or None."""
-    match = FRAME_NUM_RE.match(os.path.basename(_key(path)))
-    return int(match.group("frame")) if match else None
+    parts = split_frame(path)
+    return parts[2] if parts else None
 
 
 def frame_width(path):
     """How many digits the frame number is padded to."""
-    match = FRAME_NUM_RE.match(os.path.basename(_key(path)))
-    return len(match.group("frame")) if match else 4
+    parts = split_frame(path)
+    return parts[3] if parts else 4
 
 
 def group_orphans(orphans, enabled=True):
@@ -1706,11 +1748,68 @@ class CleanerDialog(QtWidgets.QDialog):
             "Open with default app",
             lambda: self._open_file(orphan.path))
         open_action.setEnabled(os.path.isfile(orphan.path))
+        menu.addAction("Why is this here?", lambda: self._explain(orphan))
         menu.addAction("Copy path", lambda: QtWidgets.QApplication
                        .clipboard().setText(orphan.path))
         menu.addAction("Show in Explorer", lambda: self._reveal(orphan.path))
         menu.addAction("Fit columns", self.fit_columns)
         menu.exec_(self.table.viewport().mapToGlobal(pos))
+
+    def _explain(self, group):
+        """
+        Say exactly why this row is listed, and what the scan matched on.
+
+        If a file you know is referenced turns up here, this is what tells
+        you whether the path simply did not match -- which is the report
+        worth sending back.
+        """
+        orphan = group.orphans[0]
+        used_paths, used_stems, _by = scene_references()
+
+        lines = [
+            "File on disk:",
+            "    " + orphan.path,
+            "",
+            "Match key used by the scan:",
+            "    " + _key(orphan.path),
+            "",
+            "Verdict: {}".format(group.reason),
+            "",
+            CONFIDENCE_HELP.get(group.reason, ""),
+            "",
+            "The open scene references {} path(s) and {} sequence "
+            "stem(s).".format(len(used_paths), len(used_stems)),
+        ]
+
+        stem = frame_stem(orphan.path)
+        if stem:
+            lines += [
+                "",
+                "This file reads as frame {} of the sequence:".format(
+                    frame_number(orphan.path)),
+                "    " + stem,
+                "    sequence known to the scene: {}".format(
+                    "yes" if stem in used_stems else "no"),
+            ]
+
+        # The nearest referenced paths in the same folder, which is usually
+        # enough to see a padding or spelling mismatch at a glance.
+        folder = os.path.dirname(_key(orphan.path))
+        nearby = sorted(p for p in used_paths if os.path.dirname(p) == folder)
+        if nearby:
+            lines += ["", "Referenced files in the same folder:"]
+            lines += ["    " + os.path.basename(p) for p in nearby[:10]]
+            if len(nearby) > 10:
+                lines.append("    ... and {} more".format(len(nearby) - 10))
+        else:
+            lines += ["", "Nothing in this folder is referenced at all."]
+
+        if group.other_scenes:
+            lines += ["", "Referenced by these other scenes:"]
+            lines += ["    " + os.path.basename(s)
+                      for s in group.other_scenes[:10]]
+
+        hou.ui.displayMessage("\n".join(lines), title="Why is this here?")
 
     def _show_users(self, orphan):
         """Jump to the other-scenes tab with this file's users listed."""

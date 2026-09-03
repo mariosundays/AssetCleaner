@@ -30,7 +30,7 @@ for name in ("_browse_root", "refresh", "_run", "_restore",
              "_on_scene_selected", "_on_scene_double_click",
              "_scene_files_menu", "_show_users", "_move_refs",
              "_scan_scenes", "_cancel_scene_scan", "_open_file",
-             "_regroup", "_toggle_grouping",
+             "_regroup", "_toggle_grouping", "_explain",
              "fit_columns", "_populate", "_populate_scenes",
              "_fill_ref_table", "_update_status", "_update_legend",
              "_apply_states", "_reveal", "_ref_at", "_scene_at"):
