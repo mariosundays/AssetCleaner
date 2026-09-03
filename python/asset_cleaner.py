@@ -1,0 +1,1710 @@
+# Asset Cleaner -- find unused files in a Houdini project and set them aside.
+# Copyright (C) 2026 Mario Domingos
+#
+# This program is free software: you can redistribute it and/or modify it under
+# the terms of the GNU General Public License as published by the Free Software
+# Foundation, either version 3 of the License, or (at your option) any later
+# version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
+# FOR A PARTICULAR PURPOSE. See the GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License along with
+# this program. If not, see <https://www.gnu.org/licenses/>.
+
+"""
+Asset Cleaner -- the inverse of Asset Consolidator.
+
+The consolidator walks parameters and asks "does this reference live outside
+the project?". This walks the project folder on disk and asks the opposite:
+"is anything still using this file?". What nothing uses is an orphan, and can
+be moved into <root>/_unused/ where it is out of the way but recoverable.
+
+Two tabs:
+
+  Unused files   what the open scene does not reference.
+  Other scenes   which OTHER .hip files in the project reference which files,
+                 read straight off disk without opening them.
+
+Works in Houdini 20.5 through 22.x (PySide2 and PySide6 both handled).
+
+Menu entry: Tools > Find Unused Assets
+"""
+
+import os
+import re
+import shutil
+import time
+
+import hou
+
+VERSION = "1.0.0"
+
+# ---------------------------------------------------------------------------
+# Qt compatibility -- H20.5 ships PySide2, H21+ ships PySide6.
+# ---------------------------------------------------------------------------
+
+try:
+    from PySide6 import QtCore, QtGui, QtWidgets
+    from PySide6.QtCore import Qt
+except ImportError:  # Houdini 20.5
+    from PySide2 import QtCore, QtGui, QtWidgets
+    from PySide2.QtCore import Qt
+
+
+# ---------------------------------------------------------------------------
+# What counts as a project asset
+# ---------------------------------------------------------------------------
+
+# Only these are ever considered for removal. Anything else in the project --
+# a .txt, a .py, a spreadsheet -- is left alone entirely, because "nothing in
+# the scene points at it" is not evidence that a document is rubbish.
+ASSET_EXTS = {
+    # images / textures
+    ".exr", ".hdr", ".hdri", ".png", ".jpg", ".jpeg", ".tif", ".tiff",
+    ".tga", ".bmp", ".dpx", ".cin", ".rat", ".tx", ".psd", ".pic",
+    # geometry / caches
+    ".bgeo", ".bgeo.sc", ".geo", ".vdb", ".obj", ".fbx", ".ply", ".stl",
+    ".usd", ".usda", ".usdc", ".usdz", ".sim", ".bclip", ".abc",
+}
+
+# Never walked into. Backups and the recycling folder we ourselves create.
+SKIP_DIRS = {
+    "_unused", "backup", ".git", ".svn", "__pycache__", "$recycle.bin",
+    "tmp", "temp",
+}
+
+# Scene files, which are the *readers* of assets and never the orphans.
+HIP_EXTS = (".hip", ".hiplc", ".hipnc", ".hip.bak")
+
+# Sidecars -- a file that belongs to another file rather than standing alone.
+# If the owner is used, the sidecar is used too, even though no parameter
+# names it directly.
+SIDECAR_OWNERS = {
+    ".mtl": (".obj",),
+    ".tx": (".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga"),
+    ".rat": (".exr", ".png", ".jpg", ".jpeg", ".tif", ".tiff", ".tga"),
+    ".usdc": (".usd", ".usda"),
+}
+
+COMPOUND_EXTS = (".bgeo.sc", ".bgeo.gz", ".geo.gz", ".vdb.sc")
+
+# Parameters that name a file but which we never want to treat as a reference.
+SKIP_PARM_NAMES = {"hda_path", "otl_path"}
+
+UNUSED_FOLDER = "_unused"
+
+
+def _clean(path):
+    """Normalise a path for comparison: forward slashes, no trailing slash."""
+    if not path:
+        return ""
+    path = os.path.normpath(os.path.expandvars(path)).replace("\\", "/")
+    return path.rstrip("/")
+
+
+def _key(path):
+    """The case-insensitive identity of a path, for set membership."""
+    return _clean(path).lower()
+
+
+def file_ext(filepath):
+    """
+    The extension of a path, lower case, with the dot. Compound suffixes are
+    kept whole so a cache reads ".bgeo.sc" rather than ".sc".
+    """
+    name = os.path.basename((filepath or "").replace("\\", "/")).lower()
+    for compound in COMPOUND_EXTS:
+        if name.endswith(compound):
+            return compound
+    return os.path.splitext(name)[1]
+
+
+def ext_label(filepath):
+    """Upper-case label for the Type column, e.g. EXR, JPG, BGEO.SC."""
+    ext = file_ext(filepath).lstrip(".")
+    return ext.upper() if ext else "-"
+
+
+# Distinct colour per extension, matching Asset Consolidator so the two tools
+# read the same way side by side.
+EXT_COLOURS = {
+    "exr": "#7ee787", "hdr": "#7ee787", "hdri": "#7ee787",
+    "png": "#6bb3ff", "jpg": "#6bb3ff", "jpeg": "#6bb3ff",
+    "tif": "#5fd7d7", "tiff": "#5fd7d7", "tga": "#5fd7d7",
+    "tx": "#a5d6a7", "rat": "#a5d6a7", "psd": "#c5a3ff",
+    "abc": "#d2a8ff", "usd": "#d2a8ff", "usda": "#d2a8ff",
+    "usdc": "#d2a8ff", "usdz": "#d2a8ff",
+    "bgeo": "#ffb86b", "bgeo.sc": "#ffb86b", "geo": "#ffb86b",
+    "vdb": "#ff9ec4", "obj": "#e3d16b", "fbx": "#e3d16b",
+}
+
+DEFAULT_EXT_COLOUR = "#9aa0a6"
+
+
+def ext_colour(label):
+    """Colour for an extension label as shown in the Type column."""
+    return EXT_COLOURS.get((label or "").lower(), DEFAULT_EXT_COLOUR)
+
+
+def _human(size):
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if size < 1024.0:
+            return "{:.0f} {}".format(size, unit) if unit == "B" \
+                else "{:.1f} {}".format(size, unit)
+        size /= 1024.0
+    return "{:.1f} PB".format(size)
+
+
+def _age(mtime):
+    """Human age of a timestamp: '3 days', '2 months'."""
+    if not mtime:
+        return "-"
+    seconds = max(0, time.time() - mtime)
+    for limit, div, name in ((90000, 3600, "hour"),
+                             (2592000, 86400, "day"),
+                             (31536000, 2592000, "month")):
+        if seconds < limit:
+            n = int(seconds // div)
+            return "{} {}{}".format(n, name, "" if n == 1 else "s")
+    n = int(seconds // 31536000)
+    return "{} year{}".format(n, "" if n == 1 else "s")
+
+
+# ---------------------------------------------------------------------------
+# Project root resolution -- identical rules to Asset Consolidator, so the
+# two tools always agree on where the project is.
+# ---------------------------------------------------------------------------
+
+def project_root():
+    """
+    Resolve the project root: the folder holding the current .hip file.
+
+    $HIP is preferred over $JOB because Houdini always defines it and it is
+    always correct for the open scene. $JOB is used instead when it is set to
+    something real AND the .hip lives underneath it.
+    """
+    hip = _clean(hou.getenv("HIP") or "")
+    job = _clean(hou.getenv("JOB") or "")
+
+    if job and os.path.isdir(job):
+        default_job = _clean(os.path.join(
+            os.path.expanduser("~"), "houdini_projects"))
+        if job.lower() != default_job.lower() and hip and is_inside(hip, job):
+            return job
+
+    return hip or job
+
+
+def is_inside(filepath, root):
+    """True when filepath lives under root."""
+    if not root:
+        return False
+    filepath = _clean(filepath)
+    root = _clean(root)
+    if not filepath:
+        return False
+    try:
+        common = os.path.commonpath([filepath.lower(), root.lower()])
+        return common.replace("\\", "/").rstrip("/") == root.lower()
+    except ValueError:
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Sequence handling -- $F, $F4, %04d, ####, <UDIM>
+# ---------------------------------------------------------------------------
+
+SEQ_PATTERNS = [
+    re.compile(r"\$F\d*", re.IGNORECASE),
+    re.compile(r"%0?\d*d"),
+    re.compile(r"#+"),
+    re.compile(r"<UDIM>", re.IGNORECASE),
+]
+
+
+def is_sequence(path):
+    return any(p.search(path) for p in SEQ_PATTERNS)
+
+
+def sequence_glob(path):
+    """Turn a sequence path into a glob so we can find every frame on disk."""
+    import glob as _glob
+
+    pattern = path
+    for p in SEQ_PATTERNS:
+        pattern = p.sub("*", pattern)
+    pattern = re.sub(r"\*+", "*", pattern)
+    try:
+        return sorted(_glob.glob(pattern))
+    except Exception:
+        return []
+
+
+# Any Houdini variable still sitting in a path after $HIP/$JOB are expanded:
+# $HIPNAME, $OS, $SF, ${FOO}. We cannot evaluate these outside a session, so
+# the path becomes a glob instead of being thrown away.
+VARIABLE_RE = re.compile(r"\$\{?[A-Za-z_][A-Za-z0-9_]*\}?")
+
+
+def expand_glob(path):
+    """
+    Every file on disk a path could name, once sequence tokens and leftover
+    variables are turned into wildcards.
+
+    Used for references we cannot resolve exactly. Matching too many files is
+    safe here -- it can only mark something as still in use -- while matching
+    too few would offer a live cache up for deletion.
+    """
+    import glob as _glob
+
+    pattern = path
+    for p in SEQ_PATTERNS:
+        pattern = p.sub("*", pattern)
+    pattern = VARIABLE_RE.sub("*", pattern)
+    pattern = re.sub(r"\*+", "*", pattern)
+
+    # A pattern that lost its directory to a wildcard would walk far too much.
+    if pattern.startswith("*"):
+        return []
+    try:
+        return _glob.glob(pattern)
+    except Exception:
+        return []
+
+
+def sequence_stem(path):
+    """
+    The directory + literal prefix of a sequence, used to group frames.
+    'C:/p/tex/fire.$F4.exr' -> 'c:/p/tex/fire.'
+    """
+    path = _clean(path).lower()
+    for p in SEQ_PATTERNS:
+        m = p.search(path)
+        if m:
+            return path[:m.start()]
+    return path
+
+
+# A frame number in an otherwise literal filename: fire.0007.exr, fire_0007.exr
+FRAME_RE = re.compile(r"^(?P<stem>.*?)(?P<frame>\d{3,8})(?P<ext>\.[^.]+)$")
+
+
+def frame_stem(path):
+    """
+    The stem of a numbered frame, or None when the name is not one.
+
+    'C:/p/tex/fire.0007.exr' -> 'c:/p/tex/fire.'
+
+    This exists because a scene often points at ONE explicit frame rather than
+    a $F pattern. Without it the other frames of that sequence look like
+    unrelated files and would be ticked for removal -- which is how a tool
+    like this quietly eats a cache.
+    """
+    key = _key(path)
+    folder, name = os.path.split(key)
+    match = FRAME_RE.match(name)
+    if not match:
+        return None
+    return "{}/{}".format(folder, match.group("stem"))
+
+
+# ---------------------------------------------------------------------------
+# The referenced set -- what the OPEN scene uses
+# ---------------------------------------------------------------------------
+
+def _iter_file_parms():
+    """Yield every file-typed parameter in the scene."""
+    for node in hou.node("/").allSubChildren(top_down=True,
+                                             recurse_in_locked_nodes=False):
+        try:
+            parms = node.parms()
+        except hou.OperationFailed:
+            continue
+
+        for parm in parms:
+            try:
+                template = parm.parmTemplate()
+            except Exception:
+                continue
+
+            if not isinstance(template, hou.StringParmTemplate):
+                continue
+            if template.stringType() != hou.stringParmType.FileReference:
+                continue
+            if parm.name() in SKIP_PARM_NAMES:
+                continue
+            yield parm
+
+
+def scene_references():
+    """
+    Every file the open scene points at, as a set of lower-case paths, plus
+    the sequence stems it uses.
+
+    Returns (paths, stems, by_path) where by_path maps a path to the list of
+    node paths referencing it -- that is what the "Used by" column shows.
+    """
+    paths = set()
+    stems = set()
+    by_path = {}
+
+    for parm in _iter_file_parms():
+        try:
+            raw = parm.unexpandedString()
+        except Exception:
+            continue
+        if not raw or not raw.strip():
+            continue
+
+        try:
+            resolved = parm.eval()
+        except Exception:
+            continue
+        if not resolved or not resolved.strip():
+            continue
+
+        resolved = _clean(resolved)
+        if resolved.startswith(("op:", "http:", "https:", "opdef:")):
+            continue
+
+        try:
+            node_path = parm.node().path()
+        except Exception:
+            node_path = "?"
+
+        # eval() resolves most things, but a parameter can still come back
+        # holding a variable Houdini only expands at cook time. Glob those
+        # rather than treating them as one literal, unmatchable filename.
+        if is_sequence(resolved) or VARIABLE_RE.search(resolved):
+            if is_sequence(resolved):
+                stems.add(sequence_stem(resolved))
+            for frame in expand_glob(resolved):
+                k = _key(frame)
+                paths.add(k)
+                by_path.setdefault(k, []).append(node_path)
+        else:
+            k = _key(resolved)
+            paths.add(k)
+            by_path.setdefault(k, []).append(node_path)
+            # An explicit frame still implies the sequence around it.
+            numbered = frame_stem(k)
+            if numbered:
+                stems.add(numbered)
+
+    return paths, stems, by_path
+
+
+# ---------------------------------------------------------------------------
+# Reading OTHER .hip files without opening them
+#
+# A .hip is a CPIO archive whose payload is plain hscript text -- not
+# compressed -- so the paths a closed scene references can be pulled straight
+# out with a string scan. That is what feeds the "Other scenes" tab.
+# ---------------------------------------------------------------------------
+
+# Printable runs inside the binary. Paths never span one of these.
+_PRINTABLE = re.compile(rb"[ -~]{6,400}")
+
+# A path-looking token ending in an extension we care about. Deliberately
+# broad on the leading form: absolute, $HIP/$JOB-relative, or UNC.
+_PATH_TOKEN = re.compile(
+    rb"(?:[A-Za-z]:[/\\]|\$HIP[/\\]|\$JOB[/\\]|//)"
+    rb"[^\s\"'<>|*\?,;=\)\(\]\[]{2,180}"
+    rb"\.(?:exr|hdr|hdri|png|jpe?g|tiff?|tga|bmp|dpx|cin|rat|tx|psd|pic"
+    rb"|bgeo\.sc|bgeo|geo|vdb|obj|fbx|ply|stl|usd[acz]?|sim|bclip|abc)\b",
+    re.IGNORECASE)
+
+
+def paths_in_hip(hip_path, hip_dir=None, job=None):
+    """
+    Extract every asset path a .hip file references, without opening it.
+
+    $HIP and $JOB are expanded against the scene's own folder, so a sibling
+    scene using "$HIP/tex/x.exr" resolves to the same file the open scene
+    would see. Returns a set of lower-case absolute paths.
+
+    Paths are read out of the raw file, so this reports what the scene *says*
+    it uses, including references that no longer resolve on disk. That is the
+    right side to err on for a tool that deletes things.
+
+    Any other variable left in the path ($HIPNAME, $OS, $SF in a sim
+    checkpoint) is globbed, because a path we cannot resolve exactly must
+    still be allowed to match the files it might name -- otherwise a cache
+    that IS in use looks unused.
+    """
+    hip_dir = _clean(hip_dir or os.path.dirname(hip_path))
+    job = _clean(job or hip_dir)
+
+    try:
+        with open(hip_path, "rb") as handle:
+            data = handle.read()
+    except (OSError, IOError):
+        return set()
+
+    found = set()
+    for run in _PRINTABLE.findall(data):
+        for match in _PATH_TOKEN.findall(run):
+            text = match.decode("utf-8", "replace").replace("\\", "/")
+
+            # Expand the two tokens we can resolve ourselves.
+            if text.lower().startswith("$hip/"):
+                text = hip_dir + "/" + text[5:]
+            elif text.lower().startswith("$job/"):
+                text = job + "/" + text[5:]
+
+            if is_sequence(text) or VARIABLE_RE.search(text):
+                for frame in expand_glob(text):
+                    found.add(_key(frame))
+                # Keep the unresolved form too, so the scene's own reference
+                # count still reflects what it asks for.
+                found.add(_key(text))
+            else:
+                found.add(_key(text))
+
+    return found
+
+
+def find_sibling_hips(root, exclude=None):
+    """Every .hip in the project other than the open one, newest first."""
+    exclude = _key(exclude or "")
+    hips = []
+    for folder, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+        for name in filenames:
+            if not name.lower().endswith(HIP_EXTS):
+                continue
+            full = _clean(os.path.join(folder, name))
+            if _key(full) == exclude:
+                continue
+            try:
+                mtime = os.path.getmtime(full)
+            except OSError:
+                mtime = 0
+            hips.append((mtime, full))
+    hips.sort(reverse=True)
+    return [path for _mtime, path in hips]
+
+
+def scan_other_scenes(root, exclude=None, progress=None):
+    """
+    Read every sibling .hip and report what each one references.
+
+    Returns (scenes, used_by) where scenes is a list of SceneRef and used_by
+    maps a lower-case asset path to the list of scene paths using it.
+    """
+    root = _clean(root)
+    scenes = []
+    used_by = {}
+
+    hips = find_sibling_hips(root, exclude)
+    for index, hip in enumerate(hips):
+        if progress is not None and not progress(index, len(hips), hip):
+            break
+
+        paths = paths_in_hip(hip, os.path.dirname(hip), root)
+        inside = {p for p in paths if is_inside(p, root)}
+        scenes.append(SceneRef(hip, paths, inside))
+        for path in paths:
+            used_by.setdefault(path, []).append(hip)
+
+    return scenes, used_by
+
+
+class SceneRef(object):
+    """One sibling .hip file and the assets it references."""
+
+    def __init__(self, path, all_paths, inside_paths):
+        self.path = path
+        self.all_paths = all_paths
+        self.inside_paths = inside_paths
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    @property
+    def folder(self):
+        return os.path.dirname(self.path)
+
+    @property
+    def mtime(self):
+        try:
+            return os.path.getmtime(self.path)
+        except OSError:
+            return 0
+
+    @property
+    def missing(self):
+        """References that are not on disk -- a broken link in that scene."""
+        return {p for p in self.all_paths if not os.path.exists(p)}
+
+
+# ---------------------------------------------------------------------------
+# Confidence -- how safe is it to move this file out
+# ---------------------------------------------------------------------------
+
+SAFE_NEVER = "never referenced"
+SAFE_BACKUP = "backup file"
+SAFE_VERSION = "older version"
+SAFE_SIDECAR = "sidecar of used file"
+SAFE_OTHER_SCENE = "used by other scene"
+SAFE_PARTIAL_SEQ = "partial sequence"
+
+# Names that are self-evidently disposable regardless of references.
+BACKUP_HINTS = ("_bak", ".bak", "_backup", "_old", "_tmp", "_temp",
+                ".autosave", "_copy", " - copy")
+
+VERSION_RE = re.compile(r"[._-]v(\d{2,4})\b", re.IGNORECASE)
+
+CONFIDENCE_HELP = {
+    SAFE_NEVER:
+        "Nothing in the open scene points at this file.\n"
+        "Safe to set aside, unless another scene uses it.",
+    SAFE_BACKUP:
+        "The name marks this as a backup or temporary copy.\n"
+        "Usually safe to remove even if something references it.",
+    SAFE_VERSION:
+        "An older version of a file that also exists at a higher version.\n"
+        "Kept out of the default selection -- versions are often kept "
+        "deliberately.",
+    SAFE_SIDECAR:
+        "This belongs to a file the scene does use, such as a .mtl beside\n"
+        "a used .obj. Removing it can break the file that needs it.",
+    SAFE_OTHER_SCENE:
+        "Another .hip in this project references this file.\n"
+        "See the 'Other scenes' tab. Never selected automatically.",
+    SAFE_PARTIAL_SEQ:
+        "Part of a sequence the scene uses, but this frame is outside the\n"
+        "referenced range. Never selected automatically.",
+}
+
+CONFIDENCE_COLOURS = {
+    SAFE_NEVER: "#7ee787",
+    SAFE_BACKUP: "#7ee787",
+    SAFE_VERSION: "#ffb86b",
+    SAFE_SIDECAR: "#ff9ec4",
+    SAFE_OTHER_SCENE: "#6bb3ff",
+    SAFE_PARTIAL_SEQ: "#ffb86b",
+}
+
+# Which reasons are ticked by default. Anything that hints another file or
+# scene depends on it stays unticked -- the user can still tick it by hand.
+AUTO_SELECT = {SAFE_NEVER, SAFE_BACKUP}
+
+
+def is_backup_name(path):
+    lower = os.path.basename(_clean(path)).lower()
+    return any(hint in lower for hint in BACKUP_HINTS)
+
+
+def version_of(path):
+    """The version number in a filename, or None."""
+    match = VERSION_RE.search(os.path.basename(_clean(path)))
+    return int(match.group(1)) if match else None
+
+
+def version_stem(path):
+    """The filename with its version token removed, for grouping versions."""
+    name = os.path.basename(_clean(path)).lower()
+    return VERSION_RE.sub("", name)
+
+
+# ---------------------------------------------------------------------------
+# Scanning the project folder
+# ---------------------------------------------------------------------------
+
+class Orphan(object):
+    """One file on disk that the open scene does not reference."""
+
+    def __init__(self, path, root, reason):
+        self.path = _clean(path)
+        self.root = _clean(root)
+        self.reason = reason
+        self.other_scenes = []      # SceneRef paths using it, filled in later
+        self.error = ""
+        self.moved_to = ""          # where it actually landed, after a move
+        self.selected = reason in AUTO_SELECT
+
+        try:
+            stat = os.stat(self.path)
+            self.size_bytes = stat.st_size
+            self.mtime = stat.st_mtime
+        except OSError:
+            self.size_bytes = 0
+            self.mtime = 0
+
+    @property
+    def name(self):
+        return os.path.basename(self.path)
+
+    @property
+    def relative(self):
+        """Path relative to the project root, for display and for the move."""
+        if is_inside(self.path, self.root):
+            return self.path[len(self.root):].lstrip("/")
+        return self.name
+
+    @property
+    def folder(self):
+        rel = self.relative
+        parent = os.path.dirname(rel)
+        return parent or "."
+
+    @property
+    def ext_label(self):
+        return ext_label(self.path)
+
+    @property
+    def age(self):
+        return _age(self.mtime)
+
+    @property
+    def dest(self):
+        """Where it goes: <root>/_unused/<same relative path>."""
+        return "{}/{}/{}".format(self.root, UNUSED_FOLDER, self.relative)
+
+
+def walk_project(root):
+    """Every asset file under the project root, skipping the noise folders."""
+    root = _clean(root)
+    out = []
+    for folder, dirnames, filenames in os.walk(root):
+        dirnames[:] = [d for d in dirnames if d.lower() not in SKIP_DIRS]
+        for name in filenames:
+            full = _clean(os.path.join(folder, name))
+            if file_ext(full) in ASSET_EXTS:
+                out.append(full)
+    return out
+
+
+def classify_orphan(path, used_paths, used_stems, all_on_disk):
+    """
+    Decide whether a file is an orphan and, if so, how safe it is to move.
+
+    Returns a reason string, or None when the file is genuinely in use.
+    """
+    key = _key(path)
+
+    if key in used_paths:
+        return None
+
+    # A frame sitting in a sequence the scene uses, but outside the range it
+    # actually resolved. Flag rather than hide -- but never auto-tick.
+    #
+    # Matching on the stem alone would catch "fire_render.exr" under the stem
+    # "fire_", so the rest of the name has to actually be a frame number.
+    own_stem = frame_stem(key)
+    if own_stem is not None and own_stem in used_stems:
+        return SAFE_PARTIAL_SEQ
+
+    # Backups are disposable whatever else is true, so this outranks the
+    # sidecar and version checks below.
+    if is_backup_name(path):
+        return SAFE_BACKUP
+
+    # A sidecar whose owner is in use travels with its owner.
+    ext = file_ext(path)
+    owners = SIDECAR_OWNERS.get(ext)
+    if owners:
+        base = os.path.splitext(_key(path))[0]
+        for owner_ext in owners:
+            if (base + owner_ext) in used_paths:
+                return SAFE_SIDECAR
+
+    # An older version of something that also exists at a higher version.
+    version = version_of(path)
+    if version is not None:
+        stem_name = version_stem(path)
+        folder = os.path.dirname(key)
+        for other in all_on_disk:
+            other_key = _key(other)
+            if other_key == key or os.path.dirname(other_key) != folder:
+                continue
+            if version_stem(other) != stem_name:
+                continue
+            other_version = version_of(other)
+            if other_version is not None and other_version > version:
+                return SAFE_VERSION
+
+    return SAFE_NEVER
+
+
+def scan(root=None, check_other_scenes=True, progress=None):
+    """
+    Find every asset in the project the open scene does not reference.
+
+    Returns (orphans, scenes) -- scenes is the sibling .hip report, empty when
+    check_other_scenes is False.
+    """
+    root = _clean(root or project_root())
+    if not root or not os.path.isdir(root):
+        return [], []
+
+    used_paths, used_stems, _by_path = scene_references()
+    on_disk = walk_project(root)
+
+    orphans = []
+    for path in on_disk:
+        reason = classify_orphan(path, used_paths, used_stems, on_disk)
+        if reason is not None:
+            orphans.append(Orphan(path, root, reason))
+
+    scenes = []
+    if check_other_scenes:
+        try:
+            current = hou.hipFile.path()
+        except Exception:
+            current = ""
+        scenes, used_by = scan_other_scenes(root, current, progress)
+
+        # A file another scene uses is downgraded: still listed, never ticked.
+        for orphan in orphans:
+            users = used_by.get(_key(orphan.path))
+            if users:
+                orphan.other_scenes = users
+                if orphan.reason != SAFE_BACKUP:
+                    orphan.reason = SAFE_OTHER_SCENE
+                    orphan.selected = False
+
+    orphans.sort(key=lambda o: (o.folder, o.name))
+    return orphans, scenes
+
+
+# ---------------------------------------------------------------------------
+# Moving files out -- and putting them back
+# ---------------------------------------------------------------------------
+
+def _unique_dest(dest):
+    """Never overwrite something already sitting in _unused."""
+    if not os.path.exists(dest):
+        return dest
+    stem, ext = os.path.splitext(dest)
+    for i in range(1, 1000):
+        candidate = "{}_{}{}".format(stem, i, ext)
+        if not os.path.exists(candidate):
+            return candidate
+    return dest
+
+
+def move_out(orphans, progress=None):
+    """
+    Move each orphan into <root>/_unused/, preserving its relative folder
+    structure so the move can be undone by hand or with restore().
+
+    Returns (moved, freed_bytes, errors).
+    """
+    moved = 0
+    freed = 0
+    errors = []
+
+    total = len(orphans)
+    for index, orphan in enumerate(orphans):
+        if progress is not None:
+            if not progress(index, total, orphan):
+                errors.append("Cancelled by user.")
+                break
+
+        dest = orphan.dest
+        dest_dir = os.path.dirname(dest)
+
+        try:
+            if not os.path.isdir(dest_dir):
+                os.makedirs(dest_dir)
+        except OSError as exc:
+            errors.append("{}  cannot create {}: {}".format(
+                orphan.name, dest_dir, exc))
+            continue
+
+        try:
+            size = orphan.size_bytes
+            dest = _unique_dest(dest)
+            shutil.move(orphan.path, dest)
+            orphan.moved_to = dest
+            moved += 1
+            freed += size
+        except (OSError, IOError) as exc:
+            orphan.error = str(exc)
+            errors.append("{}  move failed: {}".format(orphan.name, exc))
+
+    return moved, freed, errors
+
+
+def restore(root, progress=None):
+    """
+    Put everything in <root>/_unused/ back where it came from.
+
+    The mirror of move_out: the relative path under _unused is exactly the
+    relative path under the project, which is what makes this possible.
+    Returns (restored, errors).
+    """
+    root = _clean(root)
+    unused = "{}/{}".format(root, UNUSED_FOLDER)
+    if not os.path.isdir(unused):
+        return 0, ["Nothing to restore -- no {} folder.".format(UNUSED_FOLDER)]
+
+    items = []
+    for folder, _dirnames, filenames in os.walk(unused):
+        for name in filenames:
+            items.append(_clean(os.path.join(folder, name)))
+
+    restored = 0
+    errors = []
+    for index, source in enumerate(items):
+        if progress is not None:
+            if not progress(index, len(items), source):
+                errors.append("Cancelled by user.")
+                break
+
+        relative = source[len(unused):].lstrip("/")
+        dest = "{}/{}".format(root, relative)
+        try:
+            dest_dir = os.path.dirname(dest)
+            if not os.path.isdir(dest_dir):
+                os.makedirs(dest_dir)
+            if os.path.exists(dest):
+                errors.append("{}  already back in place, left alone".format(
+                    relative))
+                continue
+            shutil.move(source, dest)
+            restored += 1
+        except (OSError, IOError) as exc:
+            errors.append("{}  restore failed: {}".format(relative, exc))
+
+    # Clean up the empty skeleton we leave behind.
+    for folder, dirnames, filenames in os.walk(unused, topdown=False):
+        if not dirnames and not filenames:
+            try:
+                os.rmdir(folder)
+            except OSError:
+                pass
+
+    return restored, errors
+
+
+def unused_size(root):
+    """Total bytes currently sitting in the _unused folder."""
+    unused = "{}/{}".format(_clean(root), UNUSED_FOLDER)
+    total = 0
+    count = 0
+    for folder, _dirnames, filenames in os.walk(unused):
+        for name in filenames:
+            try:
+                total += os.path.getsize(os.path.join(folder, name))
+                count += 1
+            except OSError:
+                pass
+    return count, total
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+
+(COL_ON, COL_EXT, COL_FILE, COL_FOLDER, COL_REASON, COL_SIZE,
+ COL_AGE) = range(7)
+
+(SCOL_SCENE, SCOL_FOLDER, SCOL_USES, SCOL_INSIDE, SCOL_MISSING,
+ SCOL_AGE) = range(6)
+
+CHECK_COL_W = 28    # checkbox column, always this wide
+MIN_COL_W = 90      # a wide column never shrinks below this
+
+MISSING_COLOUR = "#ff6b6b"
+DIM_COLOUR = "#9aa0a6"
+
+
+class SortableItem(QtWidgets.QTableWidgetItem):
+    """
+    A cell that sorts on a supplied key rather than its displayed text.
+
+    Without this, Size would sort as a string -- "9.0 MB" landing between
+    "8.3 KB" and "99.7 KB" -- and Modified would sort alphabetically, putting
+    "2 months" before "3 days".
+    """
+
+    def __init__(self, text, key=None):
+        super(SortableItem, self).__init__(text)
+        self._key = text if key is None else key
+
+    def __lt__(self, other):
+        if isinstance(other, SortableItem):
+            try:
+                return self._key < other._key
+            except TypeError:
+                return str(self._key) < str(other._key)
+        return super(SortableItem, self).__lt__(other)
+
+
+class CleanerDialog(QtWidgets.QDialog):
+
+    def __init__(self, parent=None):
+        super(CleanerDialog, self).__init__(parent)
+        self.setWindowTitle("Find Unused Assets  v{}".format(VERSION))
+        self.resize(1120, 640)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowMinMaxButtonsHint)
+
+        self.orphans = []
+        self.scenes = []
+        self._did_initial_fit = False
+        self._user_sized = False
+        self._applying_fit = False
+        self._build_ui()
+        self.refresh()
+
+    def showEvent(self, event):
+        """
+        Fit the columns the first time the dialog is actually shown. Doing it
+        in __init__ measures a viewport that has not been laid out yet.
+        """
+        super(CleanerDialog, self).showEvent(event)
+        if not self._did_initial_fit and self.orphans:
+            self._did_initial_fit = True
+            QtCore.QTimer.singleShot(0, self.fit_columns)
+
+    def resizeEvent(self, event):
+        """Re-budget columns on resize, unless the user sized them by hand."""
+        super(CleanerDialog, self).resizeEvent(event)
+        if self._did_initial_fit and self.orphans and not self._user_sized:
+            QtCore.QTimer.singleShot(0, self.fit_columns)
+
+    def _on_section_resized(self, _index, _old, _new):
+        if not self._applying_fit:
+            self._user_sized = True
+
+    # -- construction -------------------------------------------------------
+
+    def _build_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setSpacing(8)
+
+        # Project root row
+        root_row = QtWidgets.QHBoxLayout()
+        root_row.addWidget(QtWidgets.QLabel("Project root:"))
+        self.root_field = QtWidgets.QLineEdit(project_root())
+        self.root_field.setToolTip(
+            "Files under this folder are checked against the open scene.")
+        root_row.addWidget(self.root_field, 1)
+        browse = QtWidgets.QPushButton("Browse...")
+        browse.clicked.connect(self._browse_root)
+        root_row.addWidget(browse)
+        rescan = QtWidgets.QPushButton("Rescan")
+        rescan.clicked.connect(self.refresh)
+        root_row.addWidget(rescan)
+        layout.addLayout(root_row)
+
+        self.tabs = QtWidgets.QTabWidget()
+        self.tabs.addTab(self._build_unused_tab(), "Unused files")
+        self.tabs.addTab(self._build_scenes_tab(), "Other scenes")
+        layout.addWidget(self.tabs, 1)
+
+        # Status + actions
+        self.status = QtWidgets.QLabel("")
+        self.status.setWordWrap(True)
+        layout.addWidget(self.status)
+
+        buttons = QtWidgets.QHBoxLayout()
+        self.restore_btn = QtWidgets.QPushButton("Restore _unused...")
+        self.restore_btn.setToolTip(
+            "Put everything in the _unused folder back where it came from.")
+        self.restore_btn.clicked.connect(self._restore)
+        buttons.addWidget(self.restore_btn)
+        buttons.addStretch(1)
+
+        close = QtWidgets.QPushButton("Close")
+        close.clicked.connect(self.close)
+        buttons.addWidget(close)
+
+        self.run_btn = QtWidgets.QPushButton("Move to _unused")
+        self.run_btn.setDefault(True)
+        self.run_btn.clicked.connect(self._run)
+        buttons.addWidget(self.run_btn)
+        layout.addLayout(buttons)
+
+    def _build_unused_tab(self):
+        page = QtWidgets.QWidget()
+        box = QtWidgets.QVBoxLayout(page)
+        box.setContentsMargins(0, 8, 0, 0)
+
+        self.warning = QtWidgets.QLabel("")
+        self.warning.setWordWrap(True)
+        self.warning.setStyleSheet(
+            "color:#ffb86b; background:#3a2f1c; padding:6px; "
+            "border-radius:3px;")
+        self.warning.hide()
+        box.addWidget(self.warning)
+
+        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table.setHorizontalHeaderLabels(
+            ["", "Type", "File", "Folder", "Why", "Size", "Modified"])
+        self._prep_table(self.table)
+        self.table.itemChanged.connect(self._on_item_changed)
+        self.table.customContextMenuRequested.connect(self._context_menu)
+        self.table.itemDoubleClicked.connect(self._on_double_click)
+        header = self.table.horizontalHeader()
+        header.sectionResized.connect(self._on_section_resized)
+        header.sectionDoubleClicked.connect(self._header_double_clicked)
+        box.addWidget(self.table, 1)
+
+        self.legend = QtWidgets.QLabel("")
+        self.legend.setWordWrap(True)
+        box.addWidget(self.legend)
+
+        row = QtWidgets.QHBoxLayout()
+        for label, slot in (("Select recommended", self._select_recommended),
+                            ("All", self._select_all),
+                            ("None", self._select_none),
+                            ("Invert", self._select_invert)):
+            btn = QtWidgets.QPushButton(label)
+            btn.clicked.connect(slot)
+            row.addWidget(btn)
+        row.addStretch(1)
+        box.addLayout(row)
+        return page
+
+    def _build_scenes_tab(self):
+        page = QtWidgets.QWidget()
+        box = QtWidgets.QVBoxLayout(page)
+        box.setContentsMargins(0, 8, 0, 0)
+
+        blurb = QtWidgets.QLabel(
+            "Other .hip files in this project, read straight off disk without "
+            "opening them. A file used by one of these is listed on the first "
+            "tab as <b>used by other scene</b> and is never ticked for you.")
+        blurb.setWordWrap(True)
+        blurb.setStyleSheet("color:#9aa0a6;")
+        box.addWidget(blurb)
+
+        splitter = QtWidgets.QSplitter(Qt.Vertical)
+
+        self.scene_table = QtWidgets.QTableWidget(0, 6)
+        self.scene_table.setHorizontalHeaderLabels(
+            ["Scene", "Folder", "References", "In project", "Missing",
+             "Modified"])
+        self._prep_table(self.scene_table, checkable=False)
+        self.scene_table.itemSelectionChanged.connect(self._on_scene_selected)
+        self.scene_table.itemDoubleClicked.connect(self._on_scene_double_click)
+        splitter.addWidget(self.scene_table)
+
+        lower = QtWidgets.QWidget()
+        lower_box = QtWidgets.QVBoxLayout(lower)
+        lower_box.setContentsMargins(0, 6, 0, 0)
+        self.scene_detail_label = QtWidgets.QLabel(
+            "Select a scene to see what it references.")
+        self.scene_detail_label.setStyleSheet("color:#9aa0a6;")
+        lower_box.addWidget(self.scene_detail_label)
+
+        self.scene_files = QtWidgets.QTableWidget(0, 3)
+        self.scene_files.setHorizontalHeaderLabels(
+            ["File", "Where", "On disk"])
+        self._prep_table(self.scene_files, checkable=False)
+        self.scene_files.customContextMenuRequested.connect(
+            self._scene_files_menu)
+        lower_box.addWidget(self.scene_files, 1)
+        splitter.addWidget(lower)
+
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 1)
+        box.addWidget(splitter, 1)
+        return page
+
+    def _prep_table(self, table, checkable=True):
+        """Shared table setup -- selection, sorting, context menu, look."""
+        table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
+        table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        table.setAlternatingRowColors(True)
+        table.setSortingEnabled(True)
+        table.setContextMenuPolicy(Qt.CustomContextMenu)
+        table.verticalHeader().setVisible(False)
+        table.verticalHeader().setDefaultSectionSize(22)
+        header = table.horizontalHeader()
+        header.setSectionsMovable(True)
+        header.setStretchLastSection(False)
+        header.setSectionResizeMode(QtWidgets.QHeaderView.Interactive)
+        if checkable:
+            header.setSectionResizeMode(COL_ON, QtWidgets.QHeaderView.Fixed)
+            table.setColumnWidth(COL_ON, CHECK_COL_W)
+
+    # -- scanning -----------------------------------------------------------
+
+    def _browse_root(self):
+        start = self.root_field.text() or project_root()
+        chosen = QtWidgets.QFileDialog.getExistingDirectory(
+            self, "Project root", start)
+        if chosen:
+            self.root_field.setText(_clean(chosen))
+            self.refresh()
+
+    def refresh(self):
+        root = _clean(self.root_field.text()) or project_root()
+        if not root or not os.path.isdir(root):
+            self.orphans, self.scenes = [], []
+            self._populate()
+            self.status.setText(
+                "Project root does not exist. Browse to a folder to scan.")
+            return
+
+        QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(Qt.WaitCursor))
+        try:
+            self.orphans, self.scenes = scan(root, check_other_scenes=True)
+        finally:
+            QtWidgets.QApplication.restoreOverrideCursor()
+
+        self._populate()
+        self._populate_scenes()
+        self._update_legend()
+        self._update_status()
+        if self.orphans and not self._user_sized:
+            QtCore.QTimer.singleShot(0, self.fit_columns)
+
+    # -- the unused table ---------------------------------------------------
+
+    def _populate(self):
+        table = self.table
+        table.setSortingEnabled(False)
+        table.blockSignals(True)
+        table.setRowCount(0)
+
+        for orphan in self.orphans:
+            row = table.rowCount()
+            table.insertRow(row)
+
+            check = QtWidgets.QTableWidgetItem()
+            check.setFlags(Qt.ItemIsUserCheckable | Qt.ItemIsEnabled |
+                           Qt.ItemIsSelectable)
+            check.setCheckState(
+                Qt.Checked if orphan.selected else Qt.Unchecked)
+            check.setData(Qt.UserRole, orphan.path)
+            table.setItem(row, COL_ON, check)
+
+            ext = SortableItem(orphan.ext_label)
+            ext.setForeground(QtGui.QColor(ext_colour(orphan.ext_label)))
+            table.setItem(row, COL_EXT, ext)
+
+            name = SortableItem(orphan.name)
+            name.setToolTip(orphan.path)
+            table.setItem(row, COL_FILE, name)
+
+            folder = SortableItem(orphan.folder)
+            folder.setForeground(QtGui.QColor(DIM_COLOUR))
+            table.setItem(row, COL_FOLDER, folder)
+
+            reason = SortableItem(orphan.reason)
+            reason.setForeground(
+                QtGui.QColor(CONFIDENCE_COLOURS.get(orphan.reason,
+                                                    DEFAULT_EXT_COLOUR)))
+            tip = CONFIDENCE_HELP.get(orphan.reason, "")
+            if orphan.other_scenes:
+                names = "\n".join("  " + os.path.basename(s)
+                                  for s in orphan.other_scenes[:8])
+                tip += "\n\nUsed by:\n" + names
+            reason.setToolTip(tip)
+            table.setItem(row, COL_REASON, reason)
+
+            size = SortableItem(_human(orphan.size_bytes), orphan.size_bytes)
+            size.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            table.setItem(row, COL_SIZE, size)
+
+            # Sort newest-first by negating, so "3 days" beats "2 years".
+            age = SortableItem(orphan.age, -orphan.mtime)
+            age.setForeground(QtGui.QColor(DIM_COLOUR))
+            table.setItem(row, COL_AGE, age)
+
+        table.blockSignals(False)
+        table.setSortingEnabled(True)
+
+    def _ref_at(self, row):
+        item = self.table.item(row, COL_ON)
+        if item is None:
+            return None
+        path = item.data(Qt.UserRole)
+        for orphan in self.orphans:
+            if orphan.path == path:
+                return orphan
+        return None
+
+    def _selected_rows(self):
+        return sorted({i.row() for i in self.table.selectedIndexes()})
+
+    def _set_rows(self, rows, state):
+        self.table.blockSignals(True)
+        for row in rows:
+            orphan = self._ref_at(row)
+            if orphan is None:
+                continue
+            orphan.selected = state
+            item = self.table.item(row, COL_ON)
+            if item is not None:
+                item.setCheckState(Qt.Checked if state else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._update_status()
+
+    def _isolate_rows(self, rows):
+        """Clear every tick, then select just these -- the menu default."""
+        self._set_rows(range(self.table.rowCount()), False)
+        self._set_rows(rows, True)
+
+    def _rows_where(self, predicate):
+        return [row for row in range(self.table.rowCount())
+                if self._ref_at(row) is not None
+                and predicate(self._ref_at(row))]
+
+    def _on_item_changed(self, item):
+        if item.column() != COL_ON:
+            return
+        orphan = self._ref_at(item.row())
+        if orphan is not None:
+            orphan.selected = item.checkState() == Qt.Checked
+            self._update_status()
+
+    def _on_double_click(self, item):
+        orphan = self._ref_at(item.row())
+        if orphan is not None:
+            self._reveal(orphan.path)
+
+    def _reveal(self, path):
+        """Show a file in Explorer. Windows only, quietly ignored elsewhere."""
+        path = _clean(path)
+        if not os.path.exists(path):
+            path = os.path.dirname(path)
+        try:
+            if os.name == "nt":
+                os.startfile(os.path.dirname(path))
+            else:
+                import subprocess
+                subprocess.Popen(["xdg-open", os.path.dirname(path)])
+        except Exception:
+            pass
+
+    def _context_menu(self, pos):
+        row = self.table.rowAt(pos.y())
+        if row < 0:
+            return
+        orphan = self._ref_at(row)
+        if orphan is None:
+            return
+
+        rows = self._selected_rows()
+        # Right-clicking outside the selection acts on that row, the way a
+        # file manager does.
+        if row not in rows:
+            rows = [row]
+            self.table.clearSelection()
+            self.table.selectRow(row)
+
+        menu = QtWidgets.QMenu(self)
+
+        if len(rows) > 1:
+            menu.addAction("Move these {} files now".format(len(rows)),
+                           lambda: self._move_refs(
+                               [self._ref_at(r) for r in rows],
+                               "Move {} files".format(len(rows))))
+        else:
+            menu.addAction("Move this file now",
+                           lambda: self._move_refs([orphan], "Move one file"))
+        menu.addSeparator()
+
+        menu.addAction("Select only these rows",
+                       lambda: self._isolate_rows(rows))
+        menu.addAction("Add to selection", lambda: self._set_rows(rows, True))
+        menu.addAction("Deselect these rows",
+                       lambda: self._set_rows(rows, False))
+        menu.addSeparator()
+
+        ext = orphan.ext_label
+        menu.addAction(
+            "Select only {} files".format(ext),
+            lambda: self._isolate_rows(
+                self._rows_where(lambda o: o.ext_label == ext)))
+        folder = orphan.folder
+        menu.addAction(
+            "Select only this folder",
+            lambda: self._isolate_rows(
+                self._rows_where(lambda o: o.folder == folder)))
+        reason = orphan.reason
+        menu.addAction(
+            "Select only '{}'".format(reason),
+            lambda: self._isolate_rows(
+                self._rows_where(lambda o: o.reason == reason)))
+        menu.addSeparator()
+
+        if orphan.other_scenes:
+            menu.addAction("Show scenes using this file",
+                           lambda: self._show_users(orphan))
+        menu.addAction("Copy path", lambda: QtWidgets.QApplication
+                       .clipboard().setText(orphan.path))
+        menu.addAction("Show in Explorer", lambda: self._reveal(orphan.path))
+        menu.addAction("Fit columns", self.fit_columns)
+        menu.exec_(self.table.viewport().mapToGlobal(pos))
+
+    def _show_users(self, orphan):
+        """Jump to the other-scenes tab with this file's users listed."""
+        self.tabs.setCurrentIndex(1)
+        self.scene_detail_label.setText(
+            "Scenes referencing <b>{}</b>".format(orphan.name))
+        self._fill_ref_table(
+            [(os.path.basename(s), s, "scene", os.path.exists(s))
+             for s in orphan.other_scenes])
+
+    # -- selection helpers --------------------------------------------------
+
+    def _apply_states(self, chooser):
+        """Re-tick every row from a function of the orphan."""
+        self.table.blockSignals(True)
+        for row in range(self.table.rowCount()):
+            orphan = self._ref_at(row)
+            if orphan is None:
+                continue
+            orphan.selected = chooser(orphan)
+            item = self.table.item(row, COL_ON)
+            if item is not None:
+                item.setCheckState(
+                    Qt.Checked if orphan.selected else Qt.Unchecked)
+        self.table.blockSignals(False)
+        self._update_status()
+
+    def _select_recommended(self):
+        self._apply_states(lambda o: o.reason in AUTO_SELECT)
+
+    def _select_all(self):
+        self._apply_states(lambda o: True)
+
+    def _select_none(self):
+        self._apply_states(lambda o: False)
+
+    def _select_invert(self):
+        self._apply_states(lambda o: not o.selected)
+
+    # -- the other-scenes tab ----------------------------------------------
+
+    def _populate_scenes(self):
+        table = self.scene_table
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+
+        for scene in self.scenes:
+            row = table.rowCount()
+            table.insertRow(row)
+
+            name = SortableItem(scene.name)
+            name.setToolTip(scene.path)
+            name.setData(Qt.UserRole, scene.path)
+            table.setItem(row, SCOL_SCENE, name)
+
+            folder = SortableItem(scene.folder)
+            folder.setForeground(QtGui.QColor(DIM_COLOUR))
+            table.setItem(row, SCOL_FOLDER, folder)
+
+            total = len(scene.all_paths)
+            uses = SortableItem(str(total), total)
+            uses.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            table.setItem(row, SCOL_USES, uses)
+
+            inside = len(scene.inside_paths)
+            inside_item = SortableItem(str(inside), inside)
+            inside_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            inside_item.setForeground(QtGui.QColor("#7ee787"))
+            table.setItem(row, SCOL_INSIDE, inside_item)
+
+            missing = len(scene.missing)
+            missing_item = SortableItem(str(missing), missing)
+            missing_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if missing:
+                missing_item.setForeground(QtGui.QColor(MISSING_COLOUR))
+            table.setItem(row, SCOL_MISSING, missing_item)
+
+            age = SortableItem(_age(scene.mtime), -scene.mtime)
+            age.setForeground(QtGui.QColor(DIM_COLOUR))
+            table.setItem(row, SCOL_AGE, age)
+
+        table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+
+    def _scene_at(self, row):
+        item = self.scene_table.item(row, SCOL_SCENE)
+        if item is None:
+            return None
+        path = item.data(Qt.UserRole)
+        for scene in self.scenes:
+            if scene.path == path:
+                return scene
+        return None
+
+    def _on_scene_selected(self):
+        rows = sorted({i.row() for i in self.scene_table.selectedIndexes()})
+        if not rows:
+            return
+        scene = self._scene_at(rows[0])
+        if scene is None:
+            return
+
+        root = _clean(self.root_field.text())
+        self.scene_detail_label.setText(
+            "<b>{}</b> references {} file(s) -- {} inside the project, "
+            "{} not on disk.".format(
+                scene.name, len(scene.all_paths), len(scene.inside_paths),
+                len(scene.missing)))
+
+        rows_out = []
+        for path in sorted(scene.all_paths):
+            where = "in project" if is_inside(path, root) else "outside"
+            rows_out.append((os.path.basename(path), path, where,
+                             os.path.exists(path)))
+        self._fill_ref_table(rows_out)
+
+    def _fill_ref_table(self, rows):
+        """Fill the lower table with (name, full path, where, exists) rows."""
+        table = self.scene_files
+        table.setSortingEnabled(False)
+        table.setRowCount(0)
+        for name, path, where, exists in rows:
+            row = table.rowCount()
+            table.insertRow(row)
+
+            item = SortableItem(name)
+            item.setToolTip(path)
+            item.setData(Qt.UserRole, path)
+            table.setItem(row, 0, item)
+
+            where_item = SortableItem(where)
+            where_item.setForeground(QtGui.QColor(
+                "#7ee787" if where == "in project" else DIM_COLOUR))
+            table.setItem(row, 1, where_item)
+
+            state = SortableItem("yes" if exists else "MISSING")
+            if not exists:
+                state.setForeground(QtGui.QColor(MISSING_COLOUR))
+            table.setItem(row, 2, state)
+        table.setSortingEnabled(True)
+        table.resizeColumnsToContents()
+
+    def _on_scene_double_click(self, item):
+        scene = self._scene_at(item.row())
+        if scene is not None:
+            self._reveal(scene.path)
+
+    def _scene_files_menu(self, pos):
+        row = self.scene_files.rowAt(pos.y())
+        if row < 0:
+            return
+        item = self.scene_files.item(row, 0)
+        if item is None:
+            return
+        path = item.data(Qt.UserRole)
+        menu = QtWidgets.QMenu(self)
+        menu.addAction("Copy path", lambda: QtWidgets.QApplication
+                       .clipboard().setText(path))
+        menu.addAction("Show in Explorer", lambda: self._reveal(path))
+        menu.exec_(self.scene_files.viewport().mapToGlobal(pos))
+
+    # -- column fitting -----------------------------------------------------
+
+    def fit_columns(self):
+        """
+        Budget the columns against the window width so long names and folders
+        share what is left after the narrow columns have taken what they need.
+        """
+        table = self.table
+        if table.rowCount() == 0:
+            return
+        self._applying_fit = True
+        try:
+            metrics = table.fontMetrics()
+            available = table.viewport().width() - CHECK_COL_W - 8
+            wide = [COL_FILE, COL_FOLDER]
+
+            fixed = 0
+            for col in (COL_EXT, COL_REASON, COL_SIZE, COL_AGE):
+                header_item = table.horizontalHeaderItem(col)
+                width = metrics.horizontalAdvance(
+                    header_item.text() if header_item else "") + 24
+                for row in range(table.rowCount()):
+                    item = table.item(row, col)
+                    if item is not None:
+                        width = max(width, metrics.horizontalAdvance(
+                            item.text()) + 24)
+                table.setColumnWidth(col, width)
+                fixed += width
+
+            share = max(MIN_COL_W, int((available - fixed) / len(wide)))
+            for col in wide:
+                table.setColumnWidth(col, share)
+            table.setColumnWidth(COL_ON, CHECK_COL_W)
+        finally:
+            self._applying_fit = False
+
+    def _header_double_clicked(self, _index):
+        self.fit_columns()
+
+    # -- status -------------------------------------------------------------
+
+    def _update_legend(self):
+        seen = []
+        for orphan in self.orphans:
+            if orphan.reason not in seen:
+                seen.append(orphan.reason)
+        parts = []
+        for reason in seen:
+            colour = CONFIDENCE_COLOURS.get(reason, DEFAULT_EXT_COLOUR)
+            parts.append('<span style="color:{}">&#9632;</span> {}'.format(
+                colour, reason))
+        self.legend.setText("&nbsp;&nbsp;".join(parts))
+
+    def _update_status(self):
+        chosen = [o for o in self.orphans if o.selected]
+        total_bytes = sum(o.size_bytes for o in self.orphans)
+        chosen_bytes = sum(o.size_bytes for o in chosen)
+
+        root = _clean(self.root_field.text())
+        kept, kept_bytes = unused_size(root)
+        self.restore_btn.setEnabled(kept > 0)
+        self.restore_btn.setText(
+            "Restore _unused ({} files, {})".format(kept, _human(kept_bytes))
+            if kept else "Restore _unused...")
+
+        self.run_btn.setEnabled(bool(chosen))
+        self.run_btn.setText(
+            "Move {} file{} to _unused".format(
+                len(chosen), "" if len(chosen) == 1 else "s")
+            if chosen else "Move to _unused")
+
+        self.status.setText(
+            "{} unused file(s), {} on disk.   {} ticked, {} would be "
+            "freed.".format(len(self.orphans), _human(total_bytes),
+                            len(chosen), _human(chosen_bytes)))
+
+        # The honest caveat: the Houdini walk only knows the open scene.
+        others = len(self.scenes)
+        shared = len([o for o in self.orphans if o.other_scenes])
+        if others:
+            self.warning.setText(
+                "Only the open scene was walked in Houdini. {} other .hip "
+                "file(s) here were read from disk -- {} of the files below "
+                "are referenced by one of them and are not ticked. See the "
+                "<b>Other scenes</b> tab.".format(others, shared))
+            self.warning.show()
+        else:
+            self.warning.hide()
+
+    # -- actions ------------------------------------------------------------
+
+    def _run(self):
+        chosen = [o for o in self.orphans if o.selected]
+        if not chosen:
+            return
+        self._move_refs(chosen, "Move {} file{}".format(
+            len(chosen), "" if len(chosen) == 1 else "s"))
+
+    def _move_refs(self, refs, title):
+        refs = [r for r in refs if r is not None]
+        if not refs:
+            return
+
+        total_bytes = sum(r.size_bytes for r in refs)
+        shared = [r for r in refs if r.other_scenes]
+
+        message = ("Move {} file(s), {}, into:\n\n{}/{}\n\n"
+                   "Nothing is deleted -- the files keep their folder "
+                   "structure and can be put back with Restore.".format(
+                       len(refs), _human(total_bytes),
+                       _clean(self.root_field.text()), UNUSED_FOLDER))
+        if shared:
+            message += ("\n\nWARNING: {} of these are referenced by another "
+                        ".hip in this project.".format(len(shared)))
+
+        choice = hou.ui.displayMessage(
+            message, buttons=("Move", "Cancel"),
+            severity=(hou.severityType.Warning if shared
+                      else hou.severityType.Message),
+            close_choice=1, title=title)
+        if choice != 0:
+            return
+
+        progress_dialog = QtWidgets.QProgressDialog(
+            "Moving files...", "Cancel", 0, len(refs), self)
+        progress_dialog.setWindowModality(Qt.WindowModal)
+        progress_dialog.setMinimumDuration(300)
+
+        def progress(index, total, orphan):
+            progress_dialog.setMaximum(total)
+            progress_dialog.setValue(index)
+            progress_dialog.setLabelText(orphan.name)
+            QtWidgets.QApplication.processEvents()
+            return not progress_dialog.wasCanceled()
+
+        moved, freed, errors = move_out(refs, progress)
+        progress_dialog.close()
+
+        self.refresh()
+
+        summary = "Moved {} file(s), {} freed in the project folder.".format(
+            moved, _human(freed))
+        if errors:
+            summary += "\n\n{} problem(s):\n".format(len(errors))
+            summary += "\n".join(errors[:12])
+            if len(errors) > 12:
+                summary += "\n... and {} more.".format(len(errors) - 12)
+
+        hou.ui.displayMessage(
+            summary,
+            severity=(hou.severityType.Warning if errors
+                      else hou.severityType.Message),
+            title="Asset Cleaner")
+
+    def _restore(self):
+        root = _clean(self.root_field.text())
+        kept, kept_bytes = unused_size(root)
+        if not kept:
+            return
+
+        choice = hou.ui.displayMessage(
+            "Put all {} file(s) ({}) in {}/{} back where they came "
+            "from?".format(kept, _human(kept_bytes), root, UNUSED_FOLDER),
+            buttons=("Restore", "Cancel"), close_choice=1,
+            title="Restore unused files")
+        if choice != 0:
+            return
+
+        restored, errors = restore(root)
+        self.refresh()
+
+        summary = "Restored {} file(s).".format(restored)
+        if errors:
+            summary += "\n\n{} problem(s):\n".format(len(errors))
+            summary += "\n".join(errors[:12])
+
+        hou.ui.displayMessage(
+            summary,
+            severity=(hou.severityType.Warning if errors
+                      else hou.severityType.Message),
+            title="Asset Cleaner")
+
+
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+_dialog = None
+
+
+def main(kwargs=None):
+    global _dialog
+
+    if hou.hipFile.path().endswith("untitled.hip") and not hou.getenv("JOB"):
+        hou.ui.displayMessage(
+            "Save the scene first so the project root can be determined.",
+            severity=hou.severityType.Warning)
+        return
+
+    if _dialog is not None:
+        try:
+            _dialog.close()
+            _dialog.deleteLater()
+        except Exception:
+            pass
+
+    _dialog = CleanerDialog(parent=hou.qt.mainWindow())
+    _dialog.show()
+    return _dialog

@@ -1,0 +1,58 @@
+"""
+The UI layer, as far as it can be exercised without a real Qt.
+
+Qt is stubbed, so this cannot prove the window looks right. What it does
+prove is that every method referenced by a signal actually exists and that
+the column constants line up with the headers -- the mistakes that otherwise
+only show up as a traceback in the Houdini console.
+"""
+import _stub
+from _stub import check, done
+
+import asset_cleaner as ac
+
+# -- column layout ---------------------------------------------------------
+
+check(ac.COL_ON == 0, "the checkbox is the first column")
+check(len({ac.COL_ON, ac.COL_EXT, ac.COL_FILE, ac.COL_FOLDER,
+           ac.COL_REASON, ac.COL_SIZE, ac.COL_AGE}) == 7,
+      "the seven column ids are distinct")
+check(len({ac.SCOL_SCENE, ac.SCOL_FOLDER, ac.SCOL_USES, ac.SCOL_INSIDE,
+           ac.SCOL_MISSING, ac.SCOL_AGE}) == 6,
+      "the six scene column ids are distinct")
+
+# -- every slot a signal connects to must exist ---------------------------
+
+for name in ("_browse_root", "refresh", "_run", "_restore",
+             "_select_recommended", "_select_all", "_select_none",
+             "_select_invert", "_on_item_changed", "_on_double_click",
+             "_context_menu", "_header_double_clicked", "_on_section_resized",
+             "_on_scene_selected", "_on_scene_double_click",
+             "_scene_files_menu", "_show_users", "_move_refs",
+             "fit_columns", "_populate", "_populate_scenes",
+             "_fill_ref_table", "_update_status", "_update_legend",
+             "_apply_states", "_reveal", "_ref_at", "_scene_at"):
+    check(hasattr(ac.CleanerDialog, name), "CleanerDialog." + name)
+
+check(hasattr(ac, "main"), "module entry point")
+
+# -- colours are defined for everything the tables display ----------------
+
+check(ac.ext_colour("EXR") == ac.EXT_COLOURS["exr"], "known extension")
+check(ac.ext_colour("ZZZ") == ac.DEFAULT_EXT_COLOUR, "unknown extension")
+check(ac.ext_colour("") == ac.DEFAULT_EXT_COLOUR, "empty extension")
+check(ac.ext_colour(None) == ac.DEFAULT_EXT_COLOUR, "None extension")
+
+# -- sortable cells --------------------------------------------------------
+
+items = [ac.SortableItem("1.0 MB", 1048576),
+         ac.SortableItem("999 B", 999),
+         ac.SortableItem("1.5 KB", 1536)]
+order = [i._key for i in sorted(items)]
+check(order == [999, 1536, 1048576], "size sorts by bytes, not by text")
+
+# Mixed key types must fall back to string rather than raising.
+mixed = sorted([ac.SortableItem("a", 1), ac.SortableItem("b", "x")])
+check(len(mixed) == 2, "mixed sort keys do not raise")
+
+done("test_ui")

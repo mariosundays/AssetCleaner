@@ -1,0 +1,20 @@
+{
+    "//": "Asset Cleaner -- Houdini package. HOUDINI_PACKAGE_PATH auto-resolves to this JSON's folder, so no paths need editing.",
+
+    "enable": "houdini_version >= '20.5'",
+    "show": true,
+    "process_order": 10,
+
+    "hpath": [
+        "${HOUDINI_PACKAGE_PATH}/AssetCleaner"
+    ],
+
+    "env": [
+        {
+            "PYTHONPATH": [
+                "${HOUDINI_PACKAGE_PATH}/AssetCleaner/python",
+                { "method": "prepend" }
+            ]
+        }
+    ]
+}

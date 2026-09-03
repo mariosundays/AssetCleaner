@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mainMenu>
+  <!-- Same "Tools" menu id as asset_consolidator and flipbook_to_mp4, so
+       Houdini merges the entries into one menu instead of creating a
+       duplicate. -->
+  <menuBar>
+    <subMenu id="mdomingos_tools_menu">
+      <label>Tools</label>
+      <insertBefore>help_menu</insertBefore>
+    </subMenu>
+  </menuBar>
+
+  <menu>
+    <addScriptItem id="asset_cleaner">
+      <parent>mdomingos_tools_menu</parent>
+      <label>Find Unused Assets</label>
+      <scriptCode>
+        <![CDATA[
+import asset_cleaner
+try:
+    from importlib import reload
+    reload(asset_cleaner)
+except Exception:
+    pass
+asset_cleaner.main(kwargs if "kwargs" in dir() else None)
+]]>
+      </scriptCode>
+    </addScriptItem>
+  </menu>
+</mainMenu>
