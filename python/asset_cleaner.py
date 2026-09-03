@@ -35,6 +35,7 @@ Menu entry: Tools > Find Unused Assets
 import os
 import re
 import shutil
+import sys
 import time
 
 import hou
@@ -1378,9 +1379,14 @@ class CleanerDialog(QtWidgets.QDialog):
             self._update_status()
 
     def _on_double_click(self, item):
+        """
+        Open the file itself. Looking at a mystery cache is the fastest way
+        to decide whether it matters; Show in Explorer is on the menu for
+        when the folder is what you wanted.
+        """
         orphan = self._ref_at(item.row())
         if orphan is not None:
-            self._reveal(orphan.path)
+            self._open_file(orphan.path)
 
     def _reveal(self, path):
         """Show a file in Explorer. Windows only, quietly ignored elsewhere."""
@@ -1395,6 +1401,31 @@ class CleanerDialog(QtWidgets.QDialog):
                 subprocess.Popen(["xdg-open", os.path.dirname(path)])
         except Exception:
             pass
+
+    def _open_file(self, path):
+        """
+        Open a file in whatever the OS has associated with it.
+
+        Worth having on a tool like this: the quickest way to decide whether
+        a mystery cache or texture matters is to look at it.
+        """
+        path = _clean(path)
+        if not os.path.isfile(path):
+            hou.ui.displayMessage(
+                "Not on disk any more:\n\n{}".format(path),
+                severity=hou.severityType.Warning, title="Open file")
+            return
+        try:
+            if os.name == "nt":
+                os.startfile(path)
+            else:
+                import subprocess
+                opener = "open" if sys.platform == "darwin" else "xdg-open"
+                subprocess.Popen([opener, path])
+        except Exception as exc:
+            hou.ui.displayMessage(
+                "Could not open:\n\n{}\n\n{}".format(path, exc),
+                severity=hou.severityType.Warning, title="Open file")
 
     def _context_menu(self, pos):
         row = self.table.rowAt(pos.y())
@@ -1451,6 +1482,10 @@ class CleanerDialog(QtWidgets.QDialog):
         if orphan.other_scenes:
             menu.addAction("Show scenes using this file",
                            lambda: self._show_users(orphan))
+        open_action = menu.addAction(
+            "Open with default app",
+            lambda: self._open_file(orphan.path))
+        open_action.setEnabled(os.path.isfile(orphan.path))
         menu.addAction("Copy path", lambda: QtWidgets.QApplication
                        .clipboard().setText(orphan.path))
         menu.addAction("Show in Explorer", lambda: self._reveal(orphan.path))
@@ -1675,6 +1710,9 @@ class CleanerDialog(QtWidgets.QDialog):
             return
         path = item.data(Qt.UserRole)
         menu = QtWidgets.QMenu(self)
+        open_action = menu.addAction(
+            "Open with default app", lambda: self._open_file(path))
+        open_action.setEnabled(os.path.isfile(path))
         menu.addAction("Copy path", lambda: QtWidgets.QApplication
                        .clipboard().setText(path))
         menu.addAction("Show in Explorer", lambda: self._reveal(path))

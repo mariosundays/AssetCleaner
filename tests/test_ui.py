@@ -29,7 +29,7 @@ for name in ("_browse_root", "refresh", "_run", "_restore",
              "_context_menu", "_header_double_clicked", "_on_section_resized",
              "_on_scene_selected", "_on_scene_double_click",
              "_scene_files_menu", "_show_users", "_move_refs",
-             "_scan_scenes", "_cancel_scene_scan",
+             "_scan_scenes", "_cancel_scene_scan", "_open_file",
              "fit_columns", "_populate", "_populate_scenes",
              "_fill_ref_table", "_update_status", "_update_legend",
              "_apply_states", "_reveal", "_ref_at", "_scene_at"):
@@ -89,5 +89,15 @@ check(src.index("fileReferences") < src.index("allSubChildren"),
 src = inspect.getsource(ac.scene_references)
 check("supplied" in src,
       "the expanded path from fileReferences() is reused, not re-eval()ed")
+
+# -- opening a file -------------------------------------------------------
+
+src = inspect.getsource(ac.CleanerDialog._open_file)
+check("startfile" in src, "Windows uses startfile")
+check("xdg-open" in src and "darwin" in src, "mac and linux are handled too")
+check("isfile" in src, "a file that has gone is reported, not silently ignored")
+
+src = inspect.getsource(ac.CleanerDialog._on_double_click)
+check("_open_file" in src, "double-click opens the file itself")
 
 done("test_ui")

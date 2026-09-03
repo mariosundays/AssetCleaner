@@ -12,6 +12,13 @@ Houdini 20.5+ | Windows, macOS, Linux | GPL-3.0
 
 Menu: **Tools > Find Unused Assets**
 
+![The main window](docs/screenshot-main.png)
+
+Everything the open scene does not reference, why each one is safe to remove,
+and what it costs on disk. Green rows are ticked; blue ones are used by another
+scene and left alone. Right-click isolates a group -- one file type, one
+folder, one reason:
+
 ## What it does
 
 1. Walks every file parameter in the open scene to build the *used* set.
@@ -62,6 +69,11 @@ which state you are in: **orange** until you have scanned, neutral after.
 The table lists each scene, what it references, how much of that is inside the
 project, and how many of its references are missing from disk. Select a scene
 to list its files.
+
+![The Other scenes tab](docs/screenshot-scenes.png)
+
+91 scenes read here, and 1984 files that looked unused turned out to be
+referenced by one of them.
 
 This tab is what makes the first tab trustworthy, once you run it. A
 `.hip` is a CPIO archive whose
@@ -117,9 +129,10 @@ Run it on a copy of a project the first time.
 - **Click a column heading** to sort. Size sorts by bytes and Modified by
   actual date, not as text.
 - **Drag a divider** to resize, **double-click the header** to fit everything.
-- **Double-click a row** to show the file in Explorer.
-- **Right-click** to move a single file, or to isolate a group: one type, one
-  folder, one reason.
+- **Double-click a row** to open the file in whatever app the OS associates
+  with it -- the fastest way to decide whether a mystery cache matters.
+- **Right-click** to move a single file, open it, copy its path, show it in
+  Explorer, or isolate a group: one type, one folder, one reason.
 
 ## Install
 
