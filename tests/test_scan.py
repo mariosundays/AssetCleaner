@@ -67,6 +67,12 @@ try:
         handle.write(("opparm /obj/f file ( '$HIP/tex/shared.exr' )\n")
                      .encode())
 
+    # The default must NOT read the other scenes -- it is opt-in now.
+    orphans, scenes = ac.scan(root)
+    check(scenes == [], "the default scan does not read sibling scenes")
+    check({o.name for o in orphans if o.selected} >= {"shared.exr"},
+          "and so a file used only elsewhere IS ticked until you scan")
+
     orphans, scenes = ac.scan(root, check_other_scenes=True)
     by_name = {o.name: o for o in orphans}
 
@@ -98,6 +104,22 @@ try:
     check(by_name["shared.exr"].selected,
           "without the check, the shared file WOULD be ticked -- which is "
           "exactly why the check exists")
+
+    # --- applying the scan afterwards, the way the button does --------------
+
+    orphans, _ = ac.scan(root)                      # open scene only
+    before = [o.name for o in orphans if o.selected]
+    check("shared.exr" in before, "ticked before the sibling scan")
+
+    scenes, used_by = ac.scan_other_scenes(root, root + "/current.hip")
+    changed = ac.apply_other_scenes(orphans, used_by)
+    after = [o.name for o in orphans if o.selected]
+
+    check(changed == 1, "one orphan was downgraded")
+    check("shared.exr" not in after,
+          "applying the scan afterwards unticks it, without a full rescan")
+    check(ac.SAFE_OTHER_SCENE in {o.reason for o in orphans},
+          "and marks it as used by another scene")
 
     # --- a root that does not exist ---------------------------------------
 

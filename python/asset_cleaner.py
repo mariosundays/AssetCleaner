@@ -731,12 +731,42 @@ def classify_orphan(path, used_paths, used_stems, all_on_disk):
     return SAFE_NEVER
 
 
-def scan(root=None, check_other_scenes=True, progress=None):
+def apply_other_scenes(orphans, used_by):
+    """
+    Downgrade every orphan that a sibling scene turns out to be using.
+
+    Kept separate from scan() because reading the other scenes is opt-in --
+    it reads whole .hip files off disk, so on a big project it is slow enough
+    to be worth asking for rather than doing on every rescan. This is what
+    the "Other scenes" tab runs once its scan finishes.
+
+    Returns the number of orphans that changed.
+    """
+    changed = 0
+    for orphan in orphans:
+        users = used_by.get(_key(orphan.path))
+        if not users:
+            continue
+        orphan.other_scenes = users
+        # A backup stays a backup: the name is better evidence than a
+        # reference, and it should still be offered for removal.
+        if orphan.reason != SAFE_BACKUP:
+            orphan.reason = SAFE_OTHER_SCENE
+            orphan.selected = False
+        changed += 1
+    return changed
+
+
+def scan(root=None, check_other_scenes=False, progress=None):
     """
     Find every asset in the project the open scene does not reference.
 
-    Returns (orphans, scenes) -- scenes is the sibling .hip report, empty when
-    check_other_scenes is False.
+    Only the open scene is walked by default. Reading the other .hip files in
+    the project is opt-in via check_other_scenes, because it reads them whole
+    off disk -- fine for a handful of scenes, slow for a project with years of
+    versions in it.
+
+    Returns (orphans, scenes) -- scenes is empty unless the sibling scan ran.
     """
     root = _clean(root or project_root())
     if not root or not os.path.isdir(root):
@@ -751,6 +781,8 @@ def scan(root=None, check_other_scenes=True, progress=None):
         if reason is not None:
             orphans.append(Orphan(path, root, reason))
 
+    orphans.sort(key=lambda o: (o.folder, o.name))
+
     scenes = []
     if check_other_scenes:
         try:
@@ -758,17 +790,8 @@ def scan(root=None, check_other_scenes=True, progress=None):
         except Exception:
             current = ""
         scenes, used_by = scan_other_scenes(root, current, progress)
+        apply_other_scenes(orphans, used_by)
 
-        # A file another scene uses is downgraded: still listed, never ticked.
-        for orphan in orphans:
-            users = used_by.get(_key(orphan.path))
-            if users:
-                orphan.other_scenes = users
-                if orphan.reason != SAFE_BACKUP:
-                    orphan.reason = SAFE_OTHER_SCENE
-                    orphan.selected = False
-
-    orphans.sort(key=lambda o: (o.folder, o.name))
     return orphans, scenes
 
 
@@ -914,6 +937,14 @@ MIN_COL_W = 90      # a wide column never shrinks below this
 MISSING_COLOUR = "#ff6b6b"
 DIM_COLOUR = "#9aa0a6"
 
+# The banner above the table. Orange while the sibling scan has not run --
+# that is the state where the list can quietly offer another shot's files --
+# and neutral once it has.
+WARN_STYLE = ("color:#ffb86b; background:#3a2f1c; padding:6px; "
+              "border-radius:3px;")
+INFO_STYLE = ("color:#9aa0a6; background:#242424; padding:6px; "
+              "border-radius:3px;")
+
 
 class SortableItem(QtWidgets.QTableWidgetItem):
     """
@@ -947,6 +978,8 @@ class CleanerDialog(QtWidgets.QDialog):
 
         self.orphans = []
         self.scenes = []
+        self._scanned_scenes = False        # has the sibling scan been run
+        self._scene_scan_cancelled = False
         self._did_initial_fit = False
         self._user_sized = False
         self._applying_fit = False
@@ -1029,9 +1062,7 @@ class CleanerDialog(QtWidgets.QDialog):
 
         self.warning = QtWidgets.QLabel("")
         self.warning.setWordWrap(True)
-        self.warning.setStyleSheet(
-            "color:#ffb86b; background:#3a2f1c; padding:6px; "
-            "border-radius:3px;")
+        self.warning.setStyleSheet(WARN_STYLE)
         self.warning.hide()
         box.addWidget(self.warning)
 
@@ -1070,11 +1101,39 @@ class CleanerDialog(QtWidgets.QDialog):
 
         blurb = QtWidgets.QLabel(
             "Other .hip files in this project, read straight off disk without "
-            "opening them. A file used by one of these is listed on the first "
-            "tab as <b>used by other scene</b> and is never ticked for you.")
+            "opening them. This is not run automatically -- it reads every "
+            "scene whole, which takes a moment on a big project. Once it has "
+            "run, any file a sibling scene uses is marked <b>used by other "
+            "scene</b> on the first tab and unticked.")
         blurb.setWordWrap(True)
         blurb.setStyleSheet("color:#9aa0a6;")
         box.addWidget(blurb)
+
+        # Scan row: the button, and a progress bar that only appears while
+        # the scan is actually running.
+        scan_row = QtWidgets.QHBoxLayout()
+        self.scan_scenes_btn = QtWidgets.QPushButton("Scan other scenes")
+        self.scan_scenes_btn.setToolTip(
+            "Read every other .hip in the project and report what each one "
+            "references.")
+        self.scan_scenes_btn.clicked.connect(self._scan_scenes)
+        scan_row.addWidget(self.scan_scenes_btn)
+
+        self.scene_progress = QtWidgets.QProgressBar()
+        self.scene_progress.setTextVisible(True)
+        self.scene_progress.hide()
+        scan_row.addWidget(self.scene_progress, 1)
+
+        self.scene_cancel_btn = QtWidgets.QPushButton("Cancel")
+        self.scene_cancel_btn.hide()
+        self.scene_cancel_btn.clicked.connect(self._cancel_scene_scan)
+        scan_row.addWidget(self.scene_cancel_btn)
+
+        self.scene_status = QtWidgets.QLabel("Not scanned yet.")
+        self.scene_status.setStyleSheet("color:#9aa0a6;")
+        scan_row.addWidget(self.scene_status)
+        scan_row.addStretch(1)
+        box.addLayout(scan_row)
 
         splitter = QtWidgets.QSplitter(Qt.Vertical)
 
@@ -1148,9 +1207,16 @@ class CleanerDialog(QtWidgets.QDialog):
 
         QtWidgets.QApplication.setOverrideCursor(QtGui.QCursor(Qt.WaitCursor))
         try:
-            self.orphans, self.scenes = scan(root, check_other_scenes=True)
+            # Only the open scene. Reading the other .hip files is opt-in,
+            # behind the button on the Other scenes tab.
+            self.orphans, self.scenes = scan(root, check_other_scenes=False)
         finally:
             QtWidgets.QApplication.restoreOverrideCursor()
+
+        # A rescan invalidates whatever the last sibling scan concluded.
+        self._scanned_scenes = False
+        if hasattr(self, "scene_status"):
+            self.scene_status.setText("Not scanned yet.")
 
         self._populate()
         self._populate_scenes()
@@ -1422,6 +1488,69 @@ class CleanerDialog(QtWidgets.QDialog):
         table.setSortingEnabled(True)
         table.resizeColumnsToContents()
 
+    def _cancel_scene_scan(self):
+        self._scene_scan_cancelled = True
+
+    def _scan_scenes(self):
+        """
+        Read every other .hip in the project, on demand.
+
+        Runs on the main thread with processEvents so the progress bar moves
+        and Cancel works. That is deliberate: a worker thread would need the
+        results marshalled back and cannot be interrupted mid-read anyway,
+        and the scan is IO-bound in chunks of one file.
+        """
+        root = _clean(self.root_field.text()) or project_root()
+        if not root or not os.path.isdir(root):
+            return
+
+        try:
+            current = hou.hipFile.path()
+        except Exception:
+            current = ""
+
+        self._scene_scan_cancelled = False
+        self.scan_scenes_btn.setEnabled(False)
+        self.scene_progress.setValue(0)
+        self.scene_progress.show()
+        self.scene_cancel_btn.show()
+        self.scene_status.setText("Scanning...")
+
+        def progress(index, total, hip):
+            self.scene_progress.setMaximum(max(1, total))
+            self.scene_progress.setValue(index)
+            self.scene_progress.setFormat(
+                "%v / %m  {}".format(os.path.basename(hip)))
+            QtWidgets.QApplication.processEvents()
+            return not self._scene_scan_cancelled
+
+        try:
+            self.scenes, used_by = scan_other_scenes(root, current, progress)
+        finally:
+            self.scene_progress.hide()
+            self.scene_cancel_btn.hide()
+            self.scan_scenes_btn.setEnabled(True)
+
+        # Re-tick from scratch, then apply what the scan found. Without the
+        # reset, cancelling and rescanning would keep stale downgrades from
+        # the previous run.
+        self._select_recommended()
+        shared = apply_other_scenes(self.orphans, used_by)
+
+        self._scanned_scenes = not self._scene_scan_cancelled
+        self._populate_scenes()
+        self._populate()
+        self._update_legend()
+        self._update_status()
+
+        if self._scene_scan_cancelled:
+            self.scene_status.setText(
+                "Cancelled after {} scene(s).".format(len(self.scenes)))
+        else:
+            self.scene_status.setText(
+                "{} scene(s) read, {} file(s) protected.".format(
+                    len(self.scenes), shared))
+
     def _scene_at(self, row):
         item = self.scene_table.item(row, SCOL_SCENE)
         if item is None:
@@ -1575,18 +1704,30 @@ class CleanerDialog(QtWidgets.QDialog):
             "freed.".format(len(self.orphans), _human(total_bytes),
                             len(chosen), _human(chosen_bytes)))
 
-        # The honest caveat: the Houdini walk only knows the open scene.
-        others = len(self.scenes)
+        # The honest caveat. Until the sibling scan has run, this list only
+        # knows about the open scene -- which is exactly when it is most
+        # likely to offer up another shot's textures.
         shared = len([o for o in self.orphans if o.other_scenes])
-        if others:
+        self.warning.setStyleSheet(
+            WARN_STYLE if not self._scanned_scenes else INFO_STYLE)
+        if not self._scanned_scenes:
             self.warning.setText(
-                "Only the open scene was walked in Houdini. {} other .hip "
-                "file(s) here were read from disk -- {} of the files below "
-                "are referenced by one of them and are not ticked. See the "
-                "<b>Other scenes</b> tab.".format(others, shared))
+                "This is the <b>open scene only</b>. Other .hip files in the "
+                "project have not been read, so a file another scene uses "
+                "will look unused here. Run <b>Scan other scenes</b> on the "
+                "second tab before moving anything in bulk.")
+            self.warning.show()
+        elif shared:
+            self.warning.setText(
+                "{} scene(s) read. {} file(s) below are referenced by another "
+                ".hip and have been unticked.".format(
+                    len(self.scenes), shared))
             self.warning.show()
         else:
-            self.warning.hide()
+            self.warning.setText(
+                "{} other scene(s) read -- none of them reference anything "
+                "in this list.".format(len(self.scenes)))
+            self.warning.show()
 
     # -- actions ------------------------------------------------------------
 

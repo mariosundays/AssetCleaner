@@ -17,9 +17,10 @@ Menu: **Tools > Find Unused Assets**
 1. Walks every file parameter in the open scene to build the *used* set.
 2. Walks the project folder on disk.
 3. Anything on disk that nothing points at is an orphan.
-4. Reads every **other** `.hip` in the project straight off disk, so a file
-   used by a sibling scene is flagged rather than offered up for deletion.
-5. You tick what you want; "Move to _unused" relocates it.
+4. You tick what you want; "Move to _unused" relocates it.
+
+Step 1 covers the open scene only. To account for the **other** scenes in the
+project, press **Scan other scenes** on the second tab -- see below.
 
 Nothing is deleted. Files go to `<root>/_unused/`, keeping their folder
 structure, and **Restore** puts them all back.
@@ -46,11 +47,24 @@ volunteer.
 
 ### Other scenes
 
-Every other `.hip` in the project, what each one references, how much of that
-is inside the project, and how many of its references are missing from disk.
-Select a scene to list its files.
+Press **Scan other scenes** to read every other `.hip` in the project. A
+progress bar tracks it and Cancel stops it partway.
 
-This tab is why the first tab can be trusted. A `.hip` is a CPIO archive whose
+This does not run on its own, and it does not run on rescan. It reads each
+scene whole -- around 50 MB/s -- which is nothing for a handful of files and
+a visible stall on a project carrying years of versions. Making it a button
+keeps the ordinary rescan instant.
+
+Once it has run, any file a sibling scene references is marked `used by other
+scene` on the first tab and unticked. The banner above the table tells you
+which state you are in: **orange** until you have scanned, neutral after.
+
+The table lists each scene, what it references, how much of that is inside the
+project, and how many of its references are missing from disk. Select a scene
+to list its files.
+
+This tab is what makes the first tab trustworthy, once you run it. A
+`.hip` is a CPIO archive whose
 payload is plain uncompressed text, so the paths a closed scene references can
 be read without opening it -- no Houdini session, no waiting. `$HIP` and `$JOB`
 are expanded against that scene's own folder, so a sibling using
@@ -84,8 +98,9 @@ Two cases are easy to get wrong, so they are handled explicitly:
 
 ## Safety
 
-The scan walks the open scene in Houdini and reads the other scenes as text.
-That covers the ordinary case well, but it is worth knowing the edges:
+By default the scan knows only the open scene. **A file another scene uses
+will look unused until you press Scan other scenes** -- that is why the first
+tab warns you in orange until you have. Beyond that:
 
 - A path built by an **expression** at cook time may not be found by either
   method. Check the count on the Other scenes tab looks plausible before

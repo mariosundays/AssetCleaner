@@ -29,6 +29,7 @@ for name in ("_browse_root", "refresh", "_run", "_restore",
              "_context_menu", "_header_double_clicked", "_on_section_resized",
              "_on_scene_selected", "_on_scene_double_click",
              "_scene_files_menu", "_show_users", "_move_refs",
+             "_scan_scenes", "_cancel_scene_scan",
              "fit_columns", "_populate", "_populate_scenes",
              "_fill_ref_table", "_update_status", "_update_legend",
              "_apply_states", "_reveal", "_ref_at", "_scene_at"):
@@ -54,5 +55,25 @@ check(order == [999, 1536, 1048576], "size sorts by bytes, not by text")
 # Mixed key types must fall back to string rather than raising.
 mixed = sorted([ac.SortableItem("a", 1), ac.SortableItem("b", "x")])
 check(len(mixed) == 2, "mixed sort keys do not raise")
+
+# -- the sibling scan is opt-in -------------------------------------------
+
+import inspect
+
+src = inspect.getsource(ac.CleanerDialog.refresh)
+check("check_other_scenes=False" in src,
+      "refresh must not read the other scenes -- that is what made it slow")
+
+src = inspect.getsource(ac.CleanerDialog._scan_scenes)
+check("scan_other_scenes" in src, "the button is what reads them")
+check("processEvents" in src, "the progress bar has to be pumped to move")
+check("_scene_scan_cancelled" in src, "and Cancel has to be honoured")
+
+sig = inspect.signature(ac.scan)
+check(sig.parameters["check_other_scenes"].default is False,
+      "scan() defaults to the open scene only")
+
+check(ac.WARN_STYLE != ac.INFO_STYLE,
+      "the unscanned banner looks different from the scanned one")
 
 done("test_ui")
