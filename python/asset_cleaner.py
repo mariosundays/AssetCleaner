@@ -607,6 +607,91 @@ _PATH_TOKEN = re.compile(
     re.IGNORECASE)
 
 
+# A path-looking token with NO extension: a folder.
+#
+# This exists for expressions. A File Cache node builds its path at cook time
+# from other parameters --
+#
+#     `chs("basedir") + "/" + chs("basename")` + version + frame + filetype
+#
+# -- so reading a closed scene as text recovers the backtick string, never a
+# usable path. The pieces are still there though: "basedir" holds a literal
+# "$HIP/geo", and that is enough to protect the folder without pretending to
+# evaluate anything.
+#
+# Erring toward protecting too much is the right direction here: the cost of
+# a wrong guess is one folder left alone, against a re-sim if we get it wrong
+# the other way.
+_FOLDER_TOKEN = re.compile(
+    rb"(?:[A-Za-z]:[/\\]|\$HIP[/\\]|\$JOB[/\\]|//)"
+    rb"[A-Za-z0-9_.\-/\\ ]{1,180}",
+    re.IGNORECASE)
+
+# Folders too broad to be worth protecting -- $HIP itself would protect the
+# entire project and make the tool useless.
+_TOO_BROAD = {"", ".", "/"}
+
+
+def folders_in_hip(hip_path, hip_dir=None, job=None, root=None):
+    """
+    Directories a closed scene appears to write to or read from.
+
+    Complements paths_in_hip(): that finds literal file paths, this finds the
+    folder a path is assembled inside. Returns a set of lower-case absolute
+    directories.
+    """
+    hip_dir = _clean(hip_dir or os.path.dirname(hip_path))
+    job = _clean(job or hip_dir)
+    root = _clean(root or job)
+
+    try:
+        with open(hip_path, "rb") as handle:
+            data = handle.read()
+    except (OSError, IOError):
+        return set()
+
+    # Collect and filter candidates first, then hit the filesystem once per
+    # distinct folder. A scene names the same path hundreds of times, and on
+    # a network or Dropbox share every isdir() is a round trip -- doing them
+    # naively cost the better part of a second per scene.
+    candidates = set()
+    for run in _PRINTABLE.findall(data):
+        for match in _FOLDER_TOKEN.findall(run):
+            text = match.decode("utf-8", "replace").replace("\\", "/").strip()
+
+            # A token with a file extension is a file, and paths_in_hip has
+            # it covered.
+            if file_ext(text):
+                continue
+
+            if text.lower().startswith("$hip/"):
+                text = hip_dir + "/" + text[5:]
+            elif text.lower().startswith("$job/"):
+                text = job + "/" + text[5:]
+            elif text.lower() in ("$hip", "$job"):
+                continue
+            elif text.startswith("$"):
+                continue
+
+            text = _clean(text)
+            if not text or text.lower() in _TOO_BROAD:
+                continue
+            # The project root itself, or a drive root, is far too broad.
+            if _key(text) in (_key(hip_dir), _key(job)):
+                continue
+            if len(text.rstrip("/").split("/")) < 2:
+                continue
+            candidates.add(_key(text))
+
+    # Only folders inside the project can protect anything, and isdir() is a
+    # round trip each on a network or Dropbox share. Filtering first turns
+    # ~90 stats per scene into a handful.
+    if root:
+        candidates = {c for c in candidates if is_inside(c, root)}
+
+    return {c for c in candidates if os.path.isdir(c)}
+
+
 def paths_in_hip(hip_path, hip_dir=None, job=None):
     """
     Extract every asset path a .hip file references, without opening it.
@@ -681,34 +766,48 @@ def scan_other_scenes(root, exclude=None, progress=None):
     """
     Read every sibling .hip and report what each one references.
 
-    Returns (scenes, used_by) where scenes is a list of SceneRef and used_by
-    maps a lower-case asset path to the list of scene paths using it.
+    Returns (scenes, used_by, scene_folders): a list of SceneRef, a map of
+    asset path -> scenes using it, and a map of folder -> scenes building
+    paths inside it.
     """
     root = _clean(root)
     scenes = []
     used_by = {}
+    scene_folders = {}
 
     hips = find_sibling_hips(root, exclude)
     for index, hip in enumerate(hips):
         if progress is not None and not progress(index, len(hips), hip):
             break
 
-        paths = paths_in_hip(hip, os.path.dirname(hip), root)
+        hip_dir = os.path.dirname(hip)
+        paths = paths_in_hip(hip, hip_dir, root)
         inside = {p for p in paths if is_inside(p, root)}
-        scenes.append(SceneRef(hip, paths, inside))
+
+        # Folders the scene assembles paths inside. A File Cache builds its
+        # path from other parameters, so a scene can reference a whole cache
+        # directory without any literal path appearing in the file.
+        folders = folders_in_hip(hip, hip_dir, root, root)
+
+        scenes.append(SceneRef(hip, paths, inside, folders))
         for path in paths:
             used_by.setdefault(path, []).append(hip)
+        for folder in folders:
+            scene_folders.setdefault(folder, []).append(hip)
 
-    return scenes, used_by
+    return scenes, used_by, scene_folders
 
 
 class SceneRef(object):
     """One sibling .hip file and the assets it references."""
 
-    def __init__(self, path, all_paths, inside_paths):
+    def __init__(self, path, all_paths, inside_paths, folders=()):
         self.path = path
         self.all_paths = all_paths
         self.inside_paths = inside_paths
+        # Folders this scene builds paths inside, recovered when its file
+        # parameters are expressions we cannot evaluate from text.
+        self.folders = set(folders)
 
     @property
     def name(self):
@@ -1116,7 +1215,7 @@ def classify_orphan(path, used_paths, used_stems, all_on_disk,
     return SAFE_NEVER
 
 
-def apply_other_scenes(orphans, used_by):
+def apply_other_scenes(orphans, used_by, scene_folders=None):
     """
     Downgrade every orphan that a sibling scene turns out to be using.
 
@@ -1128,8 +1227,21 @@ def apply_other_scenes(orphans, used_by):
     Returns the number of orphans that changed.
     """
     changed = 0
+    scene_folders = scene_folders or {}
+
     for orphan in orphans:
-        users = used_by.get(_key(orphan.path))
+        key = _key(orphan.path)
+        users = used_by.get(key)
+
+        # A scene that builds its paths by expression names no file we can
+        # read, but it does name the folder. Anything inside one counts as
+        # spoken for by that scene.
+        if not users:
+            for folder, owners in scene_folders.items():
+                if key.startswith(folder + "/"):
+                    users = owners
+                    break
+
         if not users:
             continue
         orphan.other_scenes = users
@@ -1178,8 +1290,9 @@ def scan(root=None, check_other_scenes=False, progress=None):
             current = hou.hipFile.path()
         except Exception:
             current = ""
-        scenes, used_by = scan_other_scenes(root, current, progress)
-        apply_other_scenes(orphans, used_by)
+        scenes, used_by, scene_folders = scan_other_scenes(
+            root, current, progress)
+        apply_other_scenes(orphans, used_by, scene_folders)
 
     return orphans, scenes
 
@@ -2109,7 +2222,8 @@ class CleanerDialog(QtWidgets.QDialog):
             return not self._scene_scan_cancelled
 
         try:
-            self.scenes, used_by = scan_other_scenes(root, current, progress)
+            self.scenes, used_by, scene_folders = scan_other_scenes(
+                root, current, progress)
         finally:
             self.scene_progress.hide()
             self.scene_cancel_btn.hide()
@@ -2119,7 +2233,7 @@ class CleanerDialog(QtWidgets.QDialog):
         # reset, cancelling and rescanning would keep stale downgrades from
         # the previous run.
         self._select_recommended()
-        shared = apply_other_scenes(self.orphans, used_by)
+        shared = apply_other_scenes(self.orphans, used_by, scene_folders)
 
         self._scanned_scenes = not self._scene_scan_cancelled
         self._populate_scenes()

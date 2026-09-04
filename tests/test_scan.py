@@ -111,7 +111,8 @@ try:
     before = [o.name for o in orphans if o.selected]
     check("shared.exr" in before, "ticked before the sibling scan")
 
-    scenes, used_by = ac.scan_other_scenes(root, root + "/current.hip")
+    scenes, used_by, sfolders = ac.scan_other_scenes(
+        root, root + "/current.hip")
     changed = ac.apply_other_scenes(orphans, used_by)
     after = [o.name for o in orphans if o.selected]
 

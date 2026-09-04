@@ -98,7 +98,7 @@ try:
 
     # -- the whole report --------------------------------------------------
 
-    scenes, used_by = ac.scan_other_scenes(
+    scenes, used_by, sfolders = ac.scan_other_scenes(
         root, os.path.join(root, "current.hip"))
     check(len(scenes) == 2, "both sibling scenes reported")
 

@@ -79,6 +79,22 @@ to list its files.
 91 scenes read here, and 1984 files that looked unused turned out to be
 referenced by one of them.
 
+### Paths built by expression
+
+A File Cache node does not store its path -- it assembles one at cook time:
+
+    `chs("basedir") + "/" + chs("basename")` + version + frame + filetype
+
+With the scene **open** this is a non-issue: Houdini evaluates it and hands
+back a real path. Reading a **closed** sibling scene is where it bites, because
+all that is in the file is the backtick string. A scene can reference an entire
+cache directory without one literal path appearing anywhere in it.
+
+The folder is still recoverable -- `basedir` holds a plain `$HIP/geo` -- so the
+scan collects directories as well as files, and anything inside one counts as
+used by that scene. It protects too much rather than too little, which is the
+right direction when the cost of being wrong is a re-sim.
+
 This tab is what makes the first tab trustworthy, once you run it. A
 `.hip` is a CPIO archive whose
 payload is plain uncompressed text, so the paths a closed scene references can
