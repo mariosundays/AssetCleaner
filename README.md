@@ -168,6 +168,13 @@ Untick **Group sequences** to go back to one row per file.
 See [INSTALL.md](INSTALL.md). Short version: put the folder somewhere, point a
 Houdini package `.json` at it, restart Houdini.
 
+## Works with
+
+Asset Cleaner stands alone, but [Scene Optimizer](../SceneOptimizer) reports on
+it alongside its companion tool and can launch it. That panel reads a
+small, fixed set of functions from here -- see
+[INTEGRATION.md](INTEGRATION.md) before renaming any of them.
+
 ## Tests
 
     python tests/run_all.py
