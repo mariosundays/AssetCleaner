@@ -3,12 +3,12 @@
 A Houdini tool that finds files in your project folder that nothing is using,
 and moves them out of the way -- without deleting anything.
 
-The companion to [Asset Consolidator](../AssetConsolidator). That one pulls
+The companion to [Asset Consolidator](https://github.com/mariosundays/AssetConsolidator). That one pulls
 outside files *in*; this one finds what is left over once you are done. Useful
 before archiving a shot or handing a project on, when a folder has collected
 years of test caches and texture versions nobody can identify any more.
 
-[Scene Optimizer](../SceneOptimizer) reports on both and launches them --
+[Scene Optimizer](https://github.com/mariosundays/SceneOptimizer) reports on both and launches them --
 see [INTEGRATION.md](INTEGRATION.md) for the surface it reads from here.
 
 Houdini 20.5+ | Windows, macOS, Linux | GPL-3.0
@@ -214,7 +214,7 @@ Untick **Group sequences** to go back to one row per file.
 
 ## Notes
 
-[Asset Consolidator's HOUDINI_NOTES.md](../AssetConsolidator/docs/HOUDINI_NOTES.md)
+[Asset Consolidator's HOUDINI_NOTES.md](https://github.com/mariosundays/AssetConsolidator/blob/main/docs/HOUDINI_NOTES.md)
 collects the scene-walking and Qt lessons behind both tools -- finding file
 parameters by `stringType`, `raw` vs `resolved`, `commonpath` on Windows,
 `exists` vs `isfile`, and the Qt table traps.
@@ -226,7 +226,7 @@ Houdini package `.json` at it, restart Houdini.
 
 ## Works with
 
-Asset Cleaner stands alone, but [Scene Optimizer](../SceneOptimizer) reports on
+Asset Cleaner stands alone, but [Scene Optimizer](https://github.com/mariosundays/SceneOptimizer) reports on
 it alongside its companion tool and can launch it. That panel reads a
 small, fixed set of functions from here -- see
 [INTEGRATION.md](INTEGRATION.md) before renaming any of them.

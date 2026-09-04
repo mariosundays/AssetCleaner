@@ -9,8 +9,8 @@ this repo.
 | Tool | Job | Repo |
 |---|---|---|
 | **Asset Cleaner** | Finds what nothing uses and moves it out | this one |
-| [Asset Consolidator](../AssetConsolidator) | Pulls outside files into the project | its own |
-| [Scene Optimizer](../SceneOptimizer) | Reports on both and launches them | its own |
+| [Asset Consolidator](https://github.com/mariosundays/AssetConsolidator) | Pulls outside files into the project | its own |
+| [Scene Optimizer](https://github.com/mariosundays/SceneOptimizer) | Reports on both and launches them | its own |
 
 ```
 Asset Cleaner ─────┐
@@ -23,7 +23,7 @@ and never needs to -- but if you change one of the things below, that panel
 stops reporting unused files correctly.
 
 Building one of these?
-[../AssetConsolidator/docs/HOUDINI_NOTES.md](../AssetConsolidator/docs/HOUDINI_NOTES.md)
+[../AssetConsolidator/docs/HOUDINI_NOTES.md](https://github.com/mariosundays/AssetConsolidator/blob/main/docs/HOUDINI_NOTES.md)
 has the scene-walking and Qt lessons, which apply to all three.
 
 ## What Scene Optimizer reads from this tool

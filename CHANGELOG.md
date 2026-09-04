@@ -48,7 +48,7 @@ deletion that are actually in use.
 - **Open with default app**, and double-click now opens the file rather than
   its folder.
 - `INTEGRATION.md`, documenting the surface [Scene
-  Optimizer](../SceneOptimizer) reads from this tool.
+  Optimizer](https://github.com/mariosundays/SceneOptimizer) reads from this tool.
 
 ### Changed
 
