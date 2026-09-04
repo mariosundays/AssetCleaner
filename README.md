@@ -240,8 +240,12 @@ restore and `.hip` reading are tested against real files in a temp folder.
 
 ## Status
 
-Young. The logic is covered by tests, but it has not been through years of
-production projects. It moves rather than deletes precisely because of that.
+v1.1.0. Used on a real project, and most of what that turned up was the tool
+being *too eager* -- caches and renders offered up that were plainly in use.
+Those are fixed and covered by tests; see [CHANGELOG.md](CHANGELOG.md).
+
+Still young. It moves rather than deletes precisely because of that, and
+anything with a hint of a dependency is listed but never pre-ticked.
 
 ## Licence
 

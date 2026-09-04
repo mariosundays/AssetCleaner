@@ -40,7 +40,7 @@ import time
 
 import hou
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 
 # ---------------------------------------------------------------------------
 # Qt compatibility -- H20.5 ships PySide2, H21+ ships PySide6.
