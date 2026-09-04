@@ -79,6 +79,95 @@ SKIP_DIRS = {
 # Scene files, which are the *readers* of assets and never the orphans.
 HIP_EXTS = (".hip", ".hiplc", ".hipnc", ".hip.bak")
 
+# ---------------------------------------------------------------------------
+# Render and comp output
+#
+# A render is not an orphan. Nothing in the scene reads it back -- that is the
+# whole point of an output -- so "nothing references this" is a meaningless
+# verdict for a frame sitting in render/ or comp/. Left unhandled these bury
+# the real orphans: a single shot can put thousands of frames in the list, all
+# of them ticked, none of them worth deleting on that evidence alone.
+#
+# They are still listed, because clearing old renders is a real thing to want.
+# They are just never recommended, and can be hidden outright.
+# ---------------------------------------------------------------------------
+
+# Parameters that name where a node WRITES. Their folders are outputs.
+OUTPUT_PARMS = {
+    "sopoutput",        # File Cache / Geometry ROP
+    "copoutput",        # Composite ROP
+    "dopoutput",        # DOP I/O
+    "vm_picture",       # Mantra
+    "picture",          # generic render output
+    "ar_picture",       # Arnold
+    "rs_outputfilenameprefix",   # Redshift
+    "outputfilename",
+    "rs_output_file",
+    "vm_dcmfilename",
+    "vm_cryptolayeroutput",
+    "lopoutput",        # USD ROP
+    "outputimage",      # Karma
+    "filename",         # Alembic / FBX ROP
+    "sopoutput1",
+    "usdfile",
+    "outfile",
+    "output",
+}
+
+# Folder names that are output by convention, for renders written by a scene
+# that is not open -- or no longer exists. Matched on a whole path segment,
+# so "renders" and "3_comp" match but "rendering_notes" does not.
+OUTPUT_DIR_NAMES = {
+    "render", "renders", "rendered", "rendering",
+    "comp", "comps", "compositing",
+    "frames", "flipbook", "flipbooks", "playblast", "playblasts",
+    "out", "output", "outputs", "preview", "previews", "proxy", "proxies",
+}
+
+# A leading order prefix is common: 05_render, 3_comp, 010_output.
+_ORDER_PREFIX = re.compile(r"^\d{1,3}[_\-. ]")
+
+
+def is_output_dir_name(name):
+    """True when a single folder name reads as a render or comp output."""
+    name = (name or "").strip().lower()
+    name = _ORDER_PREFIX.sub("", name)
+    name = name.replace("-", "_")
+    if name in OUTPUT_DIR_NAMES:
+        return True
+    # _render, render_v03, render2 -- the word plus a version or suffix.
+    stripped = name.lstrip("_")
+    for word in OUTPUT_DIR_NAMES:
+        if stripped == word:
+            return True
+        if stripped.startswith(word):
+            rest = stripped[len(word):].lstrip("_")
+            if not rest or rest.isdigit() or re.match(r"^v?\d+$", rest):
+                return True
+    return False
+
+
+def in_output_folder(path, root, output_dirs=()):
+    """
+    True when a path lives under a render or comp output folder.
+
+    Two sources, because neither alone is enough: output_dirs holds folders
+    the open scene's ROPs actually write to, which is exact but silent about
+    renders written by any other scene; the name check catches those.
+    """
+    key = _key(path)
+
+    for folder in output_dirs:
+        if key.startswith(_key(folder) + "/"):
+            return True
+
+    # Only look at segments below the project root, or a project living in
+    # "D:/renders/shot01" would call its every file an output.
+    root = _key(root)
+    inside = key[len(root):] if key.startswith(root) else key
+    parts = [p for p in os.path.dirname(inside).split("/") if p]
+    return any(is_output_dir_name(part) for part in parts)
+
 # Sidecars -- a file that belongs to another file rather than standing alone.
 # If the owner is used, the sidecar is used too, even though no parameter
 # names it directly.
@@ -422,6 +511,7 @@ def scene_references():
     paths = set()
     stems = set()
     folders = set()
+    outputs = set()
     by_path = {}
 
     for parm, supplied in _iter_file_parms():
@@ -468,6 +558,16 @@ def scene_references():
             paths.add(k)
             by_path.setdefault(k, []).append(node_path)
 
+        # A parameter that names where a node WRITES marks its folder as
+        # output. Renders are never read back, so their frames must not be
+        # judged by whether anything references them.
+        try:
+            parm_name = parm.name().lower() if parm is not None else ""
+        except Exception:
+            parm_name = ""
+        if parm_name in OUTPUT_PARMS:
+            outputs.add(_key(os.path.dirname(resolved)))
+
         # A parameter naming a directory protects everything inside it.
         if os.path.isdir(resolved):
             folders.add(_key(resolved))
@@ -483,7 +583,7 @@ def scene_references():
         if stem:
             stems.add(stem)
 
-    return paths, stems, folders, by_path
+    return paths, stems, folders, outputs, by_path
 
 
 # ---------------------------------------------------------------------------
@@ -641,6 +741,7 @@ SAFE_VERSION = "older version"
 SAFE_SIDECAR = "sidecar of used file"
 SAFE_OTHER_SCENE = "used by other scene"
 SAFE_PARTIAL_SEQ = "partial sequence"
+SAFE_OUTPUT = "render output"
 
 # Names that are self-evidently disposable regardless of references.
 BACKUP_HINTS = ("_bak", ".bak", "_backup", "_old", "_tmp", "_temp",
@@ -668,6 +769,12 @@ CONFIDENCE_HELP = {
     SAFE_PARTIAL_SEQ:
         "Part of a sequence the scene uses, but this frame is outside the\n"
         "referenced range. Never selected automatically.",
+    SAFE_OUTPUT:
+        "A render or comp output.\n"
+        "Nothing reads these back -- that is what an output is -- so\n"
+        "'nothing references it' says nothing about whether you still want\n"
+        "it. Never selected automatically. Untick 'Hide render/comp' to\n"
+        "see these, and tick them by hand to clear old renders.",
 }
 
 CONFIDENCE_COLOURS = {
@@ -677,6 +784,7 @@ CONFIDENCE_COLOURS = {
     SAFE_SIDECAR: "#ff9ec4",
     SAFE_OTHER_SCENE: "#6bb3ff",
     SAFE_PARTIAL_SEQ: "#ffb86b",
+    SAFE_OUTPUT: "#c5a3ff",
 }
 
 # Which reasons are ticked by default. Anything that hints another file or
@@ -946,7 +1054,7 @@ def version_index(paths):
 
 
 def classify_orphan(path, used_paths, used_stems, all_on_disk,
-                    used_folders=()):
+                    used_folders=(), output_dirs=(), root=""):
     """
     Decide whether a file is an orphan and, if so, how safe it is to move.
 
@@ -977,6 +1085,12 @@ def classify_orphan(path, used_paths, used_stems, all_on_disk,
     # sidecar and version checks below.
     if is_backup_name(path):
         return SAFE_BACKUP
+
+    # A render or comp output. Nothing reads these back by design, so the
+    # question "does anything reference it" simply does not apply -- and
+    # answering it anyway buries the real orphans under thousands of frames.
+    if in_output_folder(path, root, output_dirs):
+        return SAFE_OUTPUT
 
     # A sidecar whose owner is in use travels with its owner.
     ext = file_ext(path)
@@ -1043,7 +1157,8 @@ def scan(root=None, check_other_scenes=False, progress=None):
     if not root or not os.path.isdir(root):
         return [], []
 
-    used_paths, used_stems, used_folders, _by = scene_references()
+    (used_paths, used_stems, used_folders, out_dirs,
+     _by) = scene_references()
     on_disk = walk_project(root)
 
     versions = version_index(on_disk)
@@ -1051,7 +1166,7 @@ def scan(root=None, check_other_scenes=False, progress=None):
     orphans = []
     for path in on_disk:
         reason = classify_orphan(path, used_paths, used_stems, versions,
-                                 used_folders)
+                                 used_folders, out_dirs, root)
         if reason is not None:
             orphans.append(Orphan(path, root, reason))
 
@@ -1253,6 +1368,7 @@ class CleanerDialog(QtWidgets.QDialog):
         self.orphans = []           # every unused file, flat
         self.groups = []            # what the table shows: sequences collapsed
         self.group_sequences = True
+        self.hide_output = True
         self.scenes = []
         self._scanned_scenes = False        # has the sibling scan been run
         self._scene_scan_cancelled = False
@@ -1366,6 +1482,15 @@ class CleanerDialog(QtWidgets.QDialog):
             btn = QtWidgets.QPushButton(label)
             btn.clicked.connect(slot)
             row.addWidget(btn)
+
+        self.hide_output_check = QtWidgets.QCheckBox("Hide render/comp")
+        self.hide_output_check.setChecked(True)
+        self.hide_output_check.setToolTip(
+            "Hide files in render and comp folders. Nothing reads a render "
+            "back, so 'unreferenced' says nothing about whether you still "
+            "want it -- and thousands of frames bury the real orphans.")
+        self.hide_output_check.toggled.connect(self._toggle_output)
+        row.addWidget(self.hide_output_check)
 
         self.group_check = QtWidgets.QCheckBox("Group sequences")
         self.group_check.setChecked(True)
@@ -1527,9 +1652,25 @@ class CleanerDialog(QtWidgets.QDialog):
         if not self._user_sized:
             QtCore.QTimer.singleShot(0, self.fit_columns)
 
+    def _toggle_output(self, on):
+        """Show or hide render and comp output, without rescanning."""
+        self.hide_output = bool(on)
+        self._regroup()
+        self._populate()
+        self._update_legend()
+        self._update_status()
+
     def _regroup(self):
-        """Rebuild the display rows from the flat orphan list."""
-        self.groups = group_orphans(self.orphans, self.group_sequences)
+        """
+        Rebuild the display rows from the flat orphan list.
+
+        Hidden output is filtered here rather than dropped from the scan, so
+        the totals stay honest and unticking the box brings it straight back.
+        """
+        shown = self.orphans
+        if self.hide_output:
+            shown = [o for o in shown if o.reason != SAFE_OUTPUT]
+        self.groups = group_orphans(shown, self.group_sequences)
 
     def _populate(self):
         table = self.table
@@ -1793,7 +1934,8 @@ class CleanerDialog(QtWidgets.QDialog):
         worth sending back.
         """
         orphan = group.orphans[0]
-        used_paths, used_stems, used_folders, _by = scene_references()
+        (used_paths, used_stems, used_folders, out_dirs,
+         _by) = scene_references()
 
         lines = [
             "File on disk:",
@@ -2127,8 +2269,10 @@ class CleanerDialog(QtWidgets.QDialog):
         self.legend.setText("&nbsp;&nbsp;".join(parts))
 
     def _update_status(self):
-        chosen = [o for o in self.orphans if o.selected]
-        total_bytes = sum(o.size_bytes for o in self.orphans)
+        # Ticking only ever applies to visible rows, so count those.
+        visible = [o for g in self.groups for o in g.orphans]
+        chosen = [o for o in visible if o.selected]
+        total_bytes = sum(o.size_bytes for o in visible)
         chosen_bytes = sum(o.size_bytes for o in chosen)
 
         root = _clean(self.root_field.text())
@@ -2150,9 +2294,14 @@ class CleanerDialog(QtWidgets.QDialog):
             collapsed = " in {} rows ({} sequence{})".format(
                 len(self.groups), sequences, "" if sequences == 1 else "s")
 
+        # Say what is being kept out of sight, or the counts look wrong.
+        hidden = [o for o in self.orphans if o.reason == SAFE_OUTPUT]
+        if hidden and self.hide_output:
+            collapsed += ", {} render/comp file(s) hidden".format(len(hidden))
+
         self.status.setText(
-            "{} unused file(s){}, {} on disk.   {} ticked, {} would be "
-            "freed.".format(len(self.orphans), collapsed, _human(total_bytes),
+            "{} shown{}, {} on disk.   {} ticked, {} would be "
+            "freed.".format(len(visible), collapsed, _human(total_bytes),
                             len(chosen), _human(chosen_bytes)))
 
         # The honest caveat. Until the sibling scan has run, this list only
@@ -2183,7 +2332,9 @@ class CleanerDialog(QtWidgets.QDialog):
     # -- actions ------------------------------------------------------------
 
     def _run(self):
-        chosen = [o for o in self.orphans if o.selected]
+        # Only visible rows: a hidden render must never be swept up by the
+        # button, whatever its selected flag happens to say.
+        chosen = [o for g in self.groups for o in g.orphans if o.selected]
         if not chosen:
             return
         self._move_refs(chosen, "Move {} file{}".format(

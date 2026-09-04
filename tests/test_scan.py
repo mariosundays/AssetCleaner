@@ -55,7 +55,7 @@ try:
     ac.hou.hipFile = types.SimpleNamespace(
         path=lambda: root + "/current.hip")
 
-    paths, stems, folders, by_path = ac.scene_references()
+    paths, stems, folders, outputs, by_path = ac.scene_references()
     check(ac._key(used) in paths, "the referenced file is in the used set")
     check(by_path[ac._key(used)] == ["/obj/geo1/file1"],
           "used set records which node referenced it")

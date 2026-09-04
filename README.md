@@ -50,6 +50,7 @@ Only the first two are ticked for you:
 | `partial sequence` | A frame outside the range the scene uses | no |
 | `sidecar of used file` | A `.mtl` beside a used `.obj`, a `.tx` beside a used `.exr` | no |
 | `used by other scene` | Another `.hip` in the project references it | no |
+| `render output` | In a render or comp folder | no, and hidden by default |
 
 Anything hinting that something else depends on the file stays unticked. You
 can still tick it by hand -- the tool never blocks you, it just refuses to
@@ -87,6 +88,31 @@ are expanded against that scene's own folder, so a sibling using
 
 Right-click a row on the first tab and choose **Show scenes using this file**
 to jump straight here.
+
+## Render and comp output
+
+A render is not an orphan. Nothing reads it back -- that is what an output
+is -- so "nothing references this" says nothing about whether you still want
+it. Left unhandled these bury everything else: one shot can put thousands of
+frames in the list, every one of them ticked.
+
+Output is found two ways, because neither alone is enough:
+
+- **What the scene's ROPs write to.** `sopoutput`, `copoutput`, `vm_picture`,
+  the Redshift and Arnold prefixes and so on. Exact, and it works whatever the
+  folder is called -- but it only knows about the scene that is open.
+- **Folder names.** `render`, `comp`, `frames`, `out`, `flipbook`, `preview`,
+  `proxy` and their plurals, with order prefixes and versions allowed
+  (`05_render`, `comp_v03`). This catches renders written by a scene that is
+  not open, or no longer exists.
+
+Matching is on whole path segments, so `compare/` and `rendering_notes/` are
+not caught. Output words in the project root itself are ignored, or a project
+living in `D:/renders/shot01` would call every one of its own files an output.
+
+These are marked `render output`, **never ticked**, and hidden by default.
+Untick **Hide render/comp** to see them -- clearing old renders is a real
+thing to want, it just has to be deliberate.
 
 ## What is never touched
 
