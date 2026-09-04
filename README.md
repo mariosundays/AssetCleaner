@@ -8,6 +8,9 @@ outside files *in*; this one finds what is left over once you are done. Useful
 before archiving a shot or handing a project on, when a folder has collected
 years of test caches and texture versions nobody can identify any more.
 
+[Scene Optimizer](../SceneOptimizer) reports on both and launches them --
+see [INTEGRATION.md](INTEGRATION.md) for the surface it reads from here.
+
 Houdini 20.5+ | Windows, macOS, Linux | GPL-3.0
 
 Menu: **Tools > Find Unused Assets**
@@ -92,6 +95,10 @@ to jump straight here.
   is not evidence that a document is rubbish.
 - **The `.hip` files themselves**, and anything in `_unused`, `backup`,
   `.git` or `tmp`.
+- **Anything inside a folder a parameter names.** A File Cache in
+  "Constructed" mode points its Base Folder at a directory and builds the
+  filename itself, so nothing ever references those files by path. The whole
+  folder is treated as in use.
 - **Files the open scene uses**, including every frame of a sequence it
   resolves and both halves of a `$F`/`<UDIM>` pattern.
 
@@ -162,6 +169,13 @@ Untick **Group sequences** to go back to one row per file.
   with it -- the fastest way to decide whether a mystery cache matters.
 - **Right-click** to move a single file, open it, copy its path, show it in
   Explorer, or isolate a group: one type, one folder, one reason.
+
+## Notes
+
+[Asset Consolidator's HOUDINI_NOTES.md](../AssetConsolidator/docs/HOUDINI_NOTES.md)
+collects the scene-walking and Qt lessons behind both tools -- finding file
+parameters by `stringType`, `raw` vs `resolved`, `commonpath` on Windows,
+`exists` vs `isfile`, and the Qt table traps.
 
 ## Install
 

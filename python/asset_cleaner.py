@@ -412,11 +412,16 @@ def scene_references():
     Every file the open scene points at, as a set of lower-case paths, plus
     the sequence stems it uses.
 
-    Returns (paths, stems, by_path) where by_path maps a path to the list of
-    node paths referencing it -- that is what the "Used by" column shows.
+    Returns (paths, stems, folders, by_path). folders holds directories a
+    parameter names outright: a File Cache in "Constructed" mode points its
+    Base Folder at a directory and builds the filename from Base Name and
+    Version, so nothing ever references those files by path. Everything under
+    such a folder is in use, and treating it otherwise offers a live cache up
+    for deletion.
     """
     paths = set()
     stems = set()
+    folders = set()
     by_path = {}
 
     for parm, supplied in _iter_file_parms():
@@ -463,6 +468,11 @@ def scene_references():
             paths.add(k)
             by_path.setdefault(k, []).append(node_path)
 
+        # A parameter naming a directory protects everything inside it.
+        if os.path.isdir(resolved):
+            folders.add(_key(resolved))
+            continue
+
         # Register the sequence stem for EVERY reference, whatever form it
         # took. This is the safety net: if the glob above resolved nothing --
         # wrong padding, frames not rendered yet, a token we cannot expand --
@@ -473,7 +483,7 @@ def scene_references():
         if stem:
             stems.add(stem)
 
-    return paths, stems, by_path
+    return paths, stems, folders, by_path
 
 
 # ---------------------------------------------------------------------------
@@ -935,7 +945,8 @@ def version_index(paths):
     return index
 
 
-def classify_orphan(path, used_paths, used_stems, all_on_disk):
+def classify_orphan(path, used_paths, used_stems, all_on_disk,
+                    used_folders=()):
     """
     Decide whether a file is an orphan and, if so, how safe it is to move.
 
@@ -945,6 +956,13 @@ def classify_orphan(path, used_paths, used_stems, all_on_disk):
 
     if key in used_paths:
         return None
+
+    # Inside a folder a parameter names outright -- a File Cache basedir, for
+    # instance. Nothing references these files individually and nothing ever
+    # will, so an exact-path test alone would call a live cache unused.
+    for folder in used_folders:
+        if key.startswith(folder + "/"):
+            return None
 
     # A frame sitting in a sequence the scene uses, but outside the range it
     # actually resolved. Flag rather than hide -- but never auto-tick.
@@ -1025,14 +1043,15 @@ def scan(root=None, check_other_scenes=False, progress=None):
     if not root or not os.path.isdir(root):
         return [], []
 
-    used_paths, used_stems, _by_path = scene_references()
+    used_paths, used_stems, used_folders, _by = scene_references()
     on_disk = walk_project(root)
 
     versions = version_index(on_disk)
 
     orphans = []
     for path in on_disk:
-        reason = classify_orphan(path, used_paths, used_stems, versions)
+        reason = classify_orphan(path, used_paths, used_stems, versions,
+                                 used_folders)
         if reason is not None:
             orphans.append(Orphan(path, root, reason))
 
@@ -1439,6 +1458,9 @@ class CleanerDialog(QtWidgets.QDialog):
         table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
         table.setSelectionMode(QtWidgets.QAbstractItemView.ExtendedSelection)
         table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        # Elide long paths in the middle: the default throws away the right,
+        # which is the filename -- the part actually being read.
+        table.setTextElideMode(Qt.ElideMiddle)
         table.setAlternatingRowColors(True)
         table.setSortingEnabled(True)
         table.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -1515,7 +1537,7 @@ class CleanerDialog(QtWidgets.QDialog):
         table.blockSignals(True)
         table.setRowCount(0)
 
-        for index, orphan in enumerate(self.groups):
+        for orphan in self.groups:
             row = table.rowCount()
             table.insertRow(row)
 
@@ -1529,9 +1551,11 @@ class CleanerDialog(QtWidgets.QDialog):
             else:
                 check.setCheckState(
                     Qt.Checked if orphan.selected else Qt.Unchecked)
-            # Rows are keyed by their index in self.groups: a path is not
-            # unique enough once a row stands for many files.
-            check.setData(Qt.UserRole, index)
+            # Store the Group itself, not an index. Qt reorders rows on
+            # sort and self.groups is rebuilt on regroup; an index into it
+            # would drift and the user would tick one row while a different
+            # file got acted on.
+            check.setData(Qt.UserRole, orphan)
             table.setItem(row, COL_ON, check)
 
             ext = SortableItem(orphan.ext_label)
@@ -1584,11 +1608,8 @@ class CleanerDialog(QtWidgets.QDialog):
         item = self.table.item(row, COL_ON)
         if item is None:
             return None
-        index = item.data(Qt.UserRole)
-        try:
-            return self.groups[int(index)]
-        except (TypeError, ValueError, IndexError):
-            return None
+        group = item.data(Qt.UserRole)
+        return group if isinstance(group, Group) else None
 
     def _selected_rows(self):
         return sorted({i.row() for i in self.table.selectedIndexes()})
@@ -1659,6 +1680,14 @@ class CleanerDialog(QtWidgets.QDialog):
                 subprocess.Popen(["xdg-open", os.path.dirname(path)])
         except Exception:
             pass
+
+    def _popup(self, menu, widget, pos):
+        """Show a context menu. PySide2 spells it exec_, PySide6 exec."""
+        where = widget.viewport().mapToGlobal(pos)
+        if hasattr(menu, "exec_"):
+            menu.exec_(where)
+        else:
+            menu.exec(where)
 
     def _open_file(self, path):
         """
@@ -1753,7 +1782,7 @@ class CleanerDialog(QtWidgets.QDialog):
                        .clipboard().setText(orphan.path))
         menu.addAction("Show in Explorer", lambda: self._reveal(orphan.path))
         menu.addAction("Fit columns", self.fit_columns)
-        menu.exec_(self.table.viewport().mapToGlobal(pos))
+        self._popup(menu, self.table, pos)
 
     def _explain(self, group):
         """
@@ -1764,7 +1793,7 @@ class CleanerDialog(QtWidgets.QDialog):
         worth sending back.
         """
         orphan = group.orphans[0]
-        used_paths, used_stems, _by = scene_references()
+        used_paths, used_stems, used_folders, _by = scene_references()
 
         lines = [
             "File on disk:",
@@ -2042,7 +2071,7 @@ class CleanerDialog(QtWidgets.QDialog):
         menu.addAction("Copy path", lambda: QtWidgets.QApplication
                        .clipboard().setText(path))
         menu.addAction("Show in Explorer", lambda: self._reveal(path))
-        menu.exec_(self.scene_files.viewport().mapToGlobal(pos))
+        self._popup(menu, self.scene_files, pos)
 
     # -- column fitting -----------------------------------------------------
 

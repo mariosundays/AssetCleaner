@@ -133,6 +133,35 @@ try:
     check(not any(o.selected for o in orphans),
           "and its sequence neighbours are not ticked either")
 
+    # -- a parameter naming a FOLDER --------------------------------------
+    # File Cache in "Constructed" mode points Base Folder at a directory and
+    # builds the filename itself, so nothing ever references those files by
+    # path. An exact-path test alone called a live cache unused -- the bug
+    # this whole section exists for.
+
+    os.makedirs(root + "/geo/pyro_v3")
+    os.makedirs(root + "/geo/old_junk")
+    for i in range(1, 6):
+        with open(root + "/geo/pyro_v3/pyro.%04d.bgeo.sc" % i, "wb") as handle:
+            handle.write(b"x")
+    with open(root + "/geo/old_junk/stale.bgeo.sc", "wb") as handle:
+        handle.write(b"x")
+
+    orphans = scan_with(root + "/geo/pyro_v3")
+    names = [o.name for o in orphans]
+    check(not any(n.startswith("pyro.") for n in names),
+          "every file inside a referenced folder is in use")
+    check("stale.bgeo.sc" in names,
+          "but a file in a DIFFERENT folder is still found")
+
+    # The folder must not swallow a sibling whose name merely shares a prefix.
+    os.makedirs(root + "/geo/pyro_v30")
+    with open(root + "/geo/pyro_v30/other.bgeo.sc", "wb") as handle:
+        handle.write(b"x")
+    orphans = scan_with(root + "/geo/pyro_v3")
+    check("other.bgeo.sc" in [o.name for o in orphans],
+          "pyro_v30 is not inside pyro_v3 -- prefix is not containment")
+
 finally:
     shutil.rmtree(tmp, ignore_errors=True)
 

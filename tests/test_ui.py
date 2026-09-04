@@ -108,7 +108,20 @@ check("self.groups" in src, "the table renders groups, not raw orphans")
 check("PartiallyChecked" in src, "a part-ticked sequence shows as partial")
 
 src = inspect.getsource(ac.CleanerDialog._ref_at)
-check("self.groups" in src, "a row resolves to its group")
+check("isinstance(group, Group)" in src,
+      "a row carries its Group object, not an index into a list that Qt "
+      "reorders and regroup rebuilds")
+
+src = inspect.getsource(ac.CleanerDialog._populate)
+check("setData(Qt.UserRole, orphan)" in src,
+      "and _populate is what puts it there")
+
+src = inspect.getsource(ac.CleanerDialog._prep_table)
+check("ElideMiddle" in src, "long paths elide in the middle, keeping the name")
+
+src = inspect.getsource(ac.CleanerDialog._popup)
+check("exec_" in src and "hasattr" in src,
+      "menus work on PySide2 and PySide6")
 
 src = inspect.getsource(ac.CleanerDialog._move_refs)
 check("orphans" in src and "getattr" in src,
